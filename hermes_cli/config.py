@@ -1813,12 +1813,21 @@ DEFAULT_CONFIG = {
         "enforce_on_docker": True,
         # When true, `hermes egress start` refuses to start if any provider
         # env var is set that the proxy cannot strip (Anthropic native
-        # `x-api-key`, AWS Bedrock SigV4, Azure OpenAI, etc.).  These
-        # credentials would otherwise leak into the sandbox bypassing the
-        # proxy.  Defaults to false because the false-positive cost
-        # (operator has the env set but doesn't actually use that provider)
-        # is higher than the security cost of a warning.
+        # `x-api-key`, Azure OpenAI api-key, Gemini x-goog-api-key).
+        # These LLM-specific credentials would otherwise leak into the
+        # sandbox bypassing the proxy.  Generic cloud creds (AWS_*,
+        # GOOGLE_APPLICATION_CREDENTIALS) are warned about but never
+        # block.  Defaults to false because false positives (operator has
+        # the env set but doesn't actually use that provider) are common.
         "fail_on_uncovered_providers": False,
+        # When credential_source is bitwarden but the BWS access token /
+        # project_id is missing OR the bws fetch returns no values for
+        # mapped providers, the daemon raises by default.  Set this to
+        # True to opt back in to the legacy "silently fall back to host
+        # env" behaviour — useful for migrations where the operator wants
+        # to switch credential_source to bitwarden but hasn't fully wired
+        # BWS yet.  Defaults to false (strict).
+        "allow_env_fallback": False,
         # SSRF deny list applied to outbound traffic.  Omit / leave empty
         # to use the safe default: loopback, link-local (incl. cloud
         # metadata IPs at 169.254.169.254), and RFC1918.  Set to an

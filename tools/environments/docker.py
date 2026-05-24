@@ -303,9 +303,16 @@ def _egress_proxy_args_for_docker() -> tuple[list[str], dict[str, str], list[str
         "SSL_CERT_FILE": container_ca,         # Python ssl module / OpenSSL
         "CURL_CA_BUNDLE": container_ca,        # curl
         "NODE_EXTRA_CA_CERTS": container_ca,   # Node.js: adds to system store
-        "NODE_OPTIONS": "--use-openssl-ca",    # Node.js: route through OpenSSL store
+        # NOTE: NODE_OPTIONS is intentionally NOT placed in env_overrides
+        # here as a flat assignment.  We need to APPEND --use-openssl-ca
+        # to whatever the user already has in NODE_OPTIONS (e.g.
+        # --max-old-space-size=4096), not clobber it.  The append-merge
+        # happens in DockerEnvironment._merge_node_options below.
         # For the agent inside the sandbox to identify itself as proxy-aware.
         "HERMES_EGRESS_PROXY": "1",
+        # Sentinel that DockerEnvironment uses to do the NODE_OPTIONS
+        # append-merge.  Stripped from the final env before docker run.
+        "_HERMES_EGRESS_NODE_OPTIONS_APPEND": "--use-openssl-ca",
     }
 
     # Surface the per-provider proxy tokens.  The sandbox can swap these into
@@ -624,23 +631,60 @@ class DockerEnvironment(BaseEnvironment):
             try:
                 from hermes_cli.config import load_config as _load_cfg_for_collision
                 _proxy_cfg = (_load_cfg_for_collision().get("proxy") or {})
-            except ImportError:
+            except (ImportError, OSError):
+                _proxy_cfg = {}
+            except Exception as _e:  # noqa: BLE001 — narrowed below via yaml import
+                # yaml.YAMLError from a malformed config.yaml.  We import
+                # lazily because PyYAML is a soft dep in some test envs.
+                try:
+                    import yaml  # noqa: F401
+                except ImportError:
+                    raise
+                logger.warning(
+                    "Could not read proxy config for egress collision check: %s",
+                    _e,
+                )
                 _proxy_cfg = {}
             _enforce_egress = bool(_proxy_cfg.get("enforce_on_docker", True))
-            # Only the env vars that *control* the egress posture matter
-            # for collision detection — auxiliary informational vars like
-            # HERMES_EGRESS_PROXY can be safely overridden.
-            _critical = {
+            # Egress-controlling env vars that affect the proxy posture.
+            _critical_proxy_control = {
                 "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
                 "NO_PROXY", "no_proxy",
                 "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "CURL_CA_BUNDLE",
                 "NODE_EXTRA_CA_CERTS",
             }
+            # stephenschoettler #2: also block docker_env from injecting
+            # real provider keys.  `docker_env: {OPENROUTER_API_KEY: sk-real}`
+            # in config.yaml puts the live secret into the sandbox while
+            # egress is nominally enforced — defeats the entire feature.
+            # Pull the mapped real_env_name from each token mapping at
+            # call time so this stays in sync with whatever the operator
+            # has configured.
+            _critical_provider_keys: set[str] = set()
+            try:
+                from agent.proxy_sources import iron_proxy as _ip_for_mappings
+                _critical_provider_keys = {
+                    m.real_env_name for m in _ip_for_mappings.load_mappings()
+                }
+            except Exception:  # noqa: BLE001 — best-effort collision check
+                pass
+            _critical = _critical_proxy_control | _critical_provider_keys
             _collisions = sorted(
                 k for k in _critical
                 if k in self._env
-                and k in egress_env_overrides
-                and self._env[k] != egress_env_overrides[k]
+                and (
+                    k not in egress_env_overrides
+                    or self._env[k] != egress_env_overrides[k]
+                )
+                # For provider keys, ANY override is a collision (the egress
+                # path mints proxy tokens; a real key in docker_env bypasses
+                # the swap regardless of whether the egress dict happens to
+                # carry it).
+                and (
+                    k in _critical_provider_keys
+                    or (k in egress_env_overrides
+                        and self._env[k] != egress_env_overrides[k])
+                )
             )
             if _collisions:
                 _msg = (
@@ -669,7 +713,10 @@ class DockerEnvironment(BaseEnvironment):
                 (_load_cfg_for_precedence().get("proxy") or {})
                 .get("enforce_on_docker", True)
             )
-        except ImportError:
+        except (ImportError, OSError):
+            _enforce_egress_merge = True
+        except Exception:  # noqa: BLE001 — yaml.YAMLError or similar
+            # Malformed config.yaml; fail-safe to enforced.
             _enforce_egress_merge = True
 
         if _enforce_egress_merge and egress_env_overrides:
@@ -678,6 +725,29 @@ class DockerEnvironment(BaseEnvironment):
         else:
             merged_env = dict(egress_env_overrides)
             merged_env.update(self._env)
+
+        # arshkumarsingh #1: NODE_OPTIONS append-merge.  The egress path
+        # wants ``--use-openssl-ca`` so Node routes through the OpenSSL
+        # CA store ``SSL_CERT_FILE`` controls.  But the operator's
+        # ``docker_env: {NODE_OPTIONS: "--max-old-space-size=8192"}``
+        # MUST be preserved — replacing it would silently drop their
+        # tuning.  We carry the egress flag in a sentinel key
+        # ``_HERMES_EGRESS_NODE_OPTIONS_APPEND`` and merge here.
+        _egress_node_append = merged_env.pop(
+            "_HERMES_EGRESS_NODE_OPTIONS_APPEND", None,
+        )
+        if _egress_node_append:
+            existing_node = merged_env.get("NODE_OPTIONS", "")
+            # De-dup: only add if not already present (the operator may
+            # have set the same flag themselves).
+            if _egress_node_append.strip() not in existing_node.split():
+                if existing_node.strip():
+                    merged_env["NODE_OPTIONS"] = (
+                        f"{existing_node} {_egress_node_append}".strip()
+                    )
+                else:
+                    merged_env["NODE_OPTIONS"] = _egress_node_append
+
         env_args = []
         for key in sorted(merged_env):
             env_args.extend(["-e", f"{key}={merged_env[key]}"])

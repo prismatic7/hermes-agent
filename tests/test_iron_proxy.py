@@ -590,7 +590,11 @@ def test_start_proxy_writes_pidfile_when_alive(hermes_home, monkeypatch):
     # runs INSIDE start_proxy, so by the time Popen is mocked these have
     # to already be hermetic.
     monkeypatch.setattr(ip, "_pid_alive", lambda pid: True)
-    monkeypatch.setattr(ip, "_port_listening", lambda h, p: False)
+    # v3: start_proxy now REQUIRES _port_listening to return True before
+    # writing the pidfile.  The previous version of this test mocked it
+    # to False and relied on the loop falling through; the new code
+    # treats fall-through as failure and kills the child.
+    monkeypatch.setattr(ip, "_port_listening", lambda h, p: True)
     monkeypatch.setattr(ip, "iron_proxy_version", lambda b: "iron-proxy test")
 
     fake_proc = MagicMock()
@@ -1069,3 +1073,348 @@ def test_docker_env_collision_with_proxy_raises_when_enforce(hermes_home, monkey
             image="busybox",
             env={"HTTPS_PROXY": ""},  # the collision
         )
+
+
+# ---------------------------------------------------------------------------
+# v3 round: bridge-IP parser hardening (P1 #1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bogus_ip",
+    [
+        "0.0.0.0",            # INADDR_ANY — must NEVER bind here
+        "127.0.0.1",          # loopback — reject (we bind loopback explicitly)
+        "224.0.0.1",          # multicast
+        "240.0.0.0",          # reserved
+        "169.254.0.1",        # link-local / IMDS — never a real bridge
+        "8.8.8.8",            # public — never a docker bridge
+        "999.999.999.999",    # garbage that count(.)==3 used to accept
+        "aa.bb.cc.dd",        # alpha garbage
+    ],
+)
+def test_detect_docker_bridge_ip_rejects_dangerous(monkeypatch, bogus_ip):
+    """The parser must reject anything that isn't plausibly a docker
+    bridge IP.  Previously ``ip.count('.') == 3`` would accept all of
+    these and re-open the LAN exposure the bind-policy fix closed."""
+
+    fake_stdout = (
+        f"3: docker0    inet {bogus_ip}/16 brd 172.17.255.255 scope global docker0\\\n"
+        "       valid_lft forever preferred_lft forever"
+    )
+
+    def fake_run(cmd, **kw):
+        from unittest.mock import MagicMock
+        m = MagicMock()
+        m.returncode = 0
+        m.stdout = fake_stdout
+        return m
+
+    monkeypatch.setattr(ip.subprocess, "run", fake_run)
+    assert ip._detect_docker_bridge_ip() is None
+
+
+def test_detect_docker_bridge_ip_accepts_typical(monkeypatch):
+    fake_stdout = (
+        "3: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0\\\n"
+        "       valid_lft forever preferred_lft forever"
+    )
+
+    def fake_run(cmd, **kw):
+        from unittest.mock import MagicMock
+        m = MagicMock()
+        m.returncode = 0
+        m.stdout = fake_stdout
+        return m
+
+    monkeypatch.setattr(ip.subprocess, "run", fake_run)
+    assert ip._detect_docker_bridge_ip() == "172.17.0.1"
+
+
+def test_detect_docker_bridge_ip_handles_missing_ip_command(monkeypatch):
+    """No ``ip`` on PATH (or other OSError) returns None cleanly."""
+
+    def boom(*a, **k):
+        raise OSError("no such file")
+
+    monkeypatch.setattr(ip.subprocess, "run", boom)
+    assert ip._detect_docker_bridge_ip() is None
+
+
+# ---------------------------------------------------------------------------
+# v3: default deny-list adjacency (P2 IPv4-mapped-v6 + CGNAT)
+# ---------------------------------------------------------------------------
+
+
+def test_default_deny_includes_ipv4_mapped_v6(tmp_path):
+    cfg = ip.build_proxy_config(
+        mappings=[_sample_mapping()],
+        ca_cert=tmp_path / "ca.crt",
+        ca_key=tmp_path / "ca.key",
+    )
+    deny = cfg["proxy"]["upstream_deny_cidrs"]
+    assert "::ffff:0:0/96" in deny
+    assert "100.64.0.0/10" in deny    # CGNAT
+    assert "198.18.0.0/15" in deny    # RFC2544 benchmark
+
+
+# ---------------------------------------------------------------------------
+# v3: split LLM-specific blocked tier (P1 #3 + P2 non_bearer tiers)
+# ---------------------------------------------------------------------------
+
+
+def test_blocked_providers_subset_of_uncovered(hermes_home, monkeypatch):
+    """The strict tier that BLOCKS start must be a subset of the
+    uncovered-but-warn tier; the wizard surfaces ALL uncovered but only
+    blocks the LLM-specific ones."""
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIA-test")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/etc/gcp.json")
+    monkeypatch.setenv("GEMINI_API_KEY", "g-test")
+
+    uncovered = set(ip.discover_uncovered_providers())
+    blocked = set(ip.discover_blocked_providers())
+
+    # Strict subset: every blocked is also uncovered, but the reverse
+    # doesn't hold.
+    assert blocked.issubset(uncovered)
+    # AWS / GCP appdefault present but NOT blocked (those are present on
+    # most dev laptops for unrelated cloud tooling).
+    assert "AWS_ACCESS_KEY_ID" in uncovered
+    assert "AWS_ACCESS_KEY_ID" not in blocked
+    assert "GOOGLE_APPLICATION_CREDENTIALS" in uncovered
+    assert "GOOGLE_APPLICATION_CREDENTIALS" not in blocked
+    # LLM-specific providers ARE blocked.
+    assert "ANTHROPIC_API_KEY" in blocked
+    assert "GEMINI_API_KEY" in blocked
+
+
+# ---------------------------------------------------------------------------
+# v3: _pid_proc_starttime parser (handles comm with parens, brackets)
+# ---------------------------------------------------------------------------
+
+
+def test_pid_proc_starttime_parses_comm_with_parens(tmp_path, monkeypatch):
+    """``/proc/<pid>/stat`` 'comm' field can contain spaces and parens
+    (e.g. a process literally named ``weird) tail``, with the comm
+    wrapped in the outer parens producing ``(weird) tail)``).  The
+    starttime parser must split from the LAST ')' to skip the comm
+    correctly, otherwise the field-index math drifts.
+
+    Layout reminder: ``<pid> (<comm>) <state> <ppid> ... <starttime> ...``
+    where starttime is field 22 (1-indexed).  Past the LAST ')' we have
+    fields 3..N → tail index 0..N-3, so starttime is at tail index 19.
+    """
+
+    # Comm contains a ')' character inside the outer parens.  The outer
+    # parens are stripped by the kernel's stat format; we test that
+    # rfind(')') correctly finds the OUTER closing one.
+    # Format: pid (comm) state ppid pgrp session tty_nr tpgid flags
+    #         minflt cminflt majflt cmajflt utime stime cutime cstime
+    #         priority nice num_threads itrealvalue starttime ...
+    fake_stat = (
+        "12345 (weird) tail) "          # pid + comm-with-paren-and-space
+        "S 1 1 1 0 -1 4194304 "         # state ppid pgrp sess tty tpgid flags
+        "100 0 0 0 10 5 0 0 "           # minflt cminflt majflt cmajflt utime stime cutime cstime
+        "20 0 1 0 99887766 "            # priority nice nthreads itreal STARTTIME
+        "1234 5678 ...rest..."          # vsize rss ...
+    )
+
+    real_read_text = Path.read_text
+
+    def fake_read_text(self, *a, **k):
+        if str(self).startswith("/proc/12345/stat"):
+            return fake_stat
+        return real_read_text(self, *a, **k)
+
+    monkeypatch.setattr(Path, "read_text", fake_read_text)
+    assert ip._pid_proc_starttime(12345) == "99887766"
+
+
+def test_pid_proc_starttime_returns_none_on_missing_proc(monkeypatch):
+    """Non-Linux hosts or pid not running."""
+
+    def raise_oserror(self, *a, **k):
+        raise OSError("no such file")
+
+    monkeypatch.setattr(Path, "read_text", raise_oserror)
+    assert ip._pid_proc_starttime(99999) is None
+
+
+# ---------------------------------------------------------------------------
+# v3: stop_proxy SIGKILL suppression on pid recycle (P3 #5 coverage gap)
+# ---------------------------------------------------------------------------
+
+
+def test_stop_proxy_suppresses_sigkill_on_pid_recycle(hermes_home, monkeypatch):
+    """When _pid_proc_starttime returns different values before and
+    after the SIGTERM grace window, stop_proxy must NOT issue SIGKILL —
+    the original pid was recycled to an unrelated process."""
+
+    state = ip._proxy_state_dir()
+    (state / "iron-proxy.pid").write_text("12345")
+
+    # _pid_alive: always True (process at this pid keeps appearing alive)
+    monkeypatch.setattr(ip, "_pid_alive", lambda pid: True)
+
+    # Starttime changes — first call returns "AAA", second returns "BBB"
+    # (simulating PID recycle to an unrelated process during the grace).
+    starttime_responses = iter(["111", "222"])
+    monkeypatch.setattr(
+        ip, "_pid_proc_starttime",
+        lambda pid: next(starttime_responses, "222"),
+    )
+
+    # Sentinel: kill list — if SIGKILL is sent, this gets populated.
+    kills: list = []
+
+    def fake_os_kill(pid, sig):
+        kills.append((pid, sig))
+
+    monkeypatch.setattr(ip.os, "kill", fake_os_kill)
+    # Speed up the wait loop.
+    monkeypatch.setattr(ip.time, "sleep", lambda _: None)
+    # Make time advance fast.
+    orig_time = ip.time.time
+    counter = {"n": 0.0}
+
+    def fake_time():
+        counter["n"] += 1.0  # 1 second per call — past deadline immediately
+        return counter["n"]
+
+    monkeypatch.setattr(ip.time, "time", fake_time)
+
+    result = ip.stop_proxy()
+    assert result is True
+    # SIGTERM should fire, SIGKILL should NOT (recycled detection).
+    sigterm_count = sum(1 for _, s in kills if s == ip.signal.SIGTERM)
+    sigkill_count = sum(1 for _, s in kills if s == ip._KILL_SIGNAL)
+    assert sigterm_count == 1
+    assert sigkill_count == 0, f"SIGKILL was issued despite pid recycle: {kills}"
+
+
+# ---------------------------------------------------------------------------
+# v3: _reset_for_tests actually clears module state (P3 #1)
+# ---------------------------------------------------------------------------
+
+
+def test_reset_for_tests_clears_version_cache_and_nonce():
+    """_reset_for_tests must clear _VERSION_CACHE and _proxy_nonce so
+    in-process callers don't see leakage between tests."""
+
+    ip._VERSION_CACHE["dummy"] = "v0.0.0-fake"
+    ip._proxy_nonce = "fake-nonce-12345"
+    ip._reset_for_tests()
+    assert ip._VERSION_CACHE == {}
+    assert ip._proxy_nonce is None
+
+
+# ---------------------------------------------------------------------------
+# v3: version cache doesn't poison on empty stdout (P2 _VERSION_CACHE bug B)
+# ---------------------------------------------------------------------------
+
+
+def test_iron_proxy_version_does_not_cache_empty_output(monkeypatch, tmp_path):
+    """If --version returns 0 with empty stdout (corrupt binary, flag
+    rename upstream), don't poison the cache — re-probe next call."""
+
+    binary = tmp_path / "iron-proxy"
+    binary.write_text("")
+
+    # First call: returns empty output.
+    def fake_run_empty(cmd, **kw):
+        from unittest.mock import MagicMock
+        m = MagicMock()
+        m.returncode = 0
+        m.stdout = ""
+        m.stderr = ""
+        return m
+
+    ip._VERSION_CACHE.clear()
+    monkeypatch.setattr(ip.subprocess, "run", fake_run_empty)
+    assert ip.iron_proxy_version(binary) == ""
+    # Should NOT have cached the empty string.
+    assert str(binary) not in ip._VERSION_CACHE
+
+
+# ---------------------------------------------------------------------------
+# v3: NODE_OPTIONS append-merge in docker env (arshkumarsingh #1)
+# ---------------------------------------------------------------------------
+
+
+def test_docker_egress_node_options_uses_sentinel(hermes_home, monkeypatch):
+    """``_egress_proxy_args_for_docker`` should NOT put NODE_OPTIONS in
+    env_overrides directly; it uses a sentinel key
+    ``_HERMES_EGRESS_NODE_OPTIONS_APPEND`` so DockerEnvironment can
+    append-merge with the operator's existing NODE_OPTIONS."""
+
+    from tools.environments.docker import _egress_proxy_args_for_docker
+    from hermes_cli.config import load_config, save_config
+
+    state = ip._proxy_state_dir()
+    ca = state / "ca.crt"
+    ca.write_text("fake-ca")
+    (state / "ca.key").write_text("fake-key")
+    mapping = _sample_mapping("OPENROUTER_API_KEY")
+    proxy_cfg = ip.build_proxy_config(
+        mappings=[mapping], ca_cert=ca, ca_key=state / "ca.key", tunnel_port=9090,
+    )
+    ip.write_proxy_config(proxy_cfg)
+    ip.write_mappings([mapping])
+
+    cfg = load_config()
+    cfg.setdefault("proxy", {})["enabled"] = True
+    cfg["proxy"]["enforce_on_docker"] = True
+    save_config(cfg)
+
+    (state / "iron-proxy.pid").write_text("99999")
+    monkeypatch.setattr(ip, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(ip, "_port_listening", lambda h, p: True)
+
+    _, env, _ = _egress_proxy_args_for_docker()
+    # The egress dict should contain the sentinel, NOT a raw NODE_OPTIONS.
+    assert env.get("_HERMES_EGRESS_NODE_OPTIONS_APPEND") == "--use-openssl-ca"
+    assert "NODE_OPTIONS" not in env, (
+        "NODE_OPTIONS in egress env_overrides would clobber the operator's "
+        "docker_env NODE_OPTIONS — that's exactly the bug arshkumarsingh "
+        "flagged."
+    )
+
+
+# ---------------------------------------------------------------------------
+# v3: ensure_audit_log fails loud on OSError (P2 promise mismatch)
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_audit_log_raises_on_immutable_parent(tmp_path, monkeypatch):
+    """When the audit log can't be created with 0o600 (planted symlink,
+    immutable dir, disk full), raise — silently logging a warning would
+    let the daemon create the file under default umask, breaking the
+    privacy promise."""
+
+    # Aim at a path whose parent doesn't exist — open() will OSError.
+    audit = tmp_path / "definitely-does-not-exist" / "audit.log"
+    with pytest.raises(RuntimeError, match="audit log"):
+        ip.ensure_audit_log(audit)
+
+
+# ---------------------------------------------------------------------------
+# v3: persisted nonce roundtrip (stephenschoettler #3 cross-CLI defense)
+# ---------------------------------------------------------------------------
+
+
+def test_persisted_nonce_roundtrip(hermes_home, monkeypatch):
+    """Write the nonce next to the pidfile (simulating one CLI invocation
+    finishing start_proxy), then verify a fresh _read_persisted_nonce
+    can pick it up — that's what cross-process _pid_alive uses."""
+
+    nonce_path = ip._persisted_nonce_path()
+    nonce_path.parent.mkdir(parents=True, exist_ok=True)
+    nonce_path.write_text("test-nonce-abc123")
+    assert ip._read_persisted_nonce() == "test-nonce-abc123"
+
+
+def test_persisted_nonce_returns_none_when_missing(hermes_home):
+    """No nonce file → None, callers fall back to argv0 basename."""
+    assert ip._read_persisted_nonce() is None

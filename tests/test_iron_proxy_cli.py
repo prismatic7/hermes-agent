@@ -57,7 +57,7 @@ def _args(**overrides):
 
 
 def test_cmd_install_success_returns_0(hermes_home, monkeypatch):
-    monkeypatch.setattr(ip, "install_iron_proxy", lambda **kw: Path("/tmp/iron-proxy"))
+    monkeypatch.setattr(ip, "install_iron_proxy", lambda **kw: hermes_home / "iron-proxy")
     monkeypatch.setattr(ip, "iron_proxy_version", lambda b: "v0.39.0-test")
     rc = proxy_cli.cmd_install(_args())
     assert rc == 0
@@ -88,7 +88,7 @@ def test_cmd_setup_from_bitwarden_refuses_when_bw_disabled(hermes_home, monkeypa
     save_config(cfg)
 
     # Pre-stub install + CA so we get to step 3.
-    monkeypatch.setattr(ip, "find_iron_proxy", lambda **kw: Path("/tmp/iron-proxy"))
+    monkeypatch.setattr(ip, "find_iron_proxy", lambda **kw: hermes_home / "iron-proxy")
     monkeypatch.setattr(ip, "iron_proxy_version", lambda b: "test")
     monkeypatch.setattr(
         ip, "ensure_ca_cert",
@@ -118,7 +118,7 @@ def test_cmd_setup_from_bitwarden_refuses_when_token_missing(hermes_home, monkey
     save_config(cfg)
     monkeypatch.delenv("BWS_ACCESS_TOKEN", raising=False)
 
-    monkeypatch.setattr(ip, "find_iron_proxy", lambda **kw: Path("/tmp/iron-proxy"))
+    monkeypatch.setattr(ip, "find_iron_proxy", lambda **kw: hermes_home / "iron-proxy")
     monkeypatch.setattr(ip, "iron_proxy_version", lambda b: "test")
     monkeypatch.setattr(
         ip, "ensure_ca_cert",
@@ -144,7 +144,7 @@ def test_cmd_setup_from_bitwarden_refuses_on_empty_vault(hermes_home, monkeypatc
     save_config(cfg)
     monkeypatch.setenv("BWS_ACCESS_TOKEN", "bwsk-test-token")
 
-    monkeypatch.setattr(ip, "find_iron_proxy", lambda **kw: Path("/tmp/iron-proxy"))
+    monkeypatch.setattr(ip, "find_iron_proxy", lambda **kw: hermes_home / "iron-proxy")
     monkeypatch.setattr(ip, "iron_proxy_version", lambda b: "test")
     monkeypatch.setattr(
         ip, "ensure_ca_cert",
@@ -167,7 +167,7 @@ def test_cmd_setup_rejects_tunnel_port_zero(hermes_home, monkeypatch):
     the default before the fix)."""
 
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
-    monkeypatch.setattr(ip, "find_iron_proxy", lambda **kw: Path("/tmp/iron-proxy"))
+    monkeypatch.setattr(ip, "find_iron_proxy", lambda **kw: hermes_home / "iron-proxy")
     monkeypatch.setattr(ip, "iron_proxy_version", lambda b: "test")
     monkeypatch.setattr(
         ip, "ensure_ca_cert",
@@ -219,8 +219,16 @@ def test_cmd_start_passes_bitwarden_refresh_flag_when_credential_source_is_bitwa
     cfg.setdefault("proxy", {})["enabled"] = True
     cfg["proxy"]["credential_source"] = "bitwarden"
     cfg["proxy"]["fail_on_uncovered_providers"] = False
-    cfg.setdefault("secrets", {})["bitwarden"] = {"enabled": True}
+    cfg.setdefault("secrets", {})["bitwarden"] = {
+        "enabled": True,
+        "project_id": "test-proj-id",
+        "access_token_env": "BWS_ACCESS_TOKEN",
+    }
     save_config(cfg)
+    # v3: cmd_start now pre-checks BWS access token + project_id before
+    # calling start_proxy.  Provide both so we get to the rotation
+    # wire-up code path.
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "bwsk-test-access-token")
 
     captured: dict = {}
     def fake_start_proxy(**kw):
@@ -232,11 +240,41 @@ def test_cmd_start_passes_bitwarden_refresh_flag_when_credential_source_is_bitwa
         return s
     monkeypatch.setattr(ip, "start_proxy", fake_start_proxy)
     monkeypatch.setattr(ip, "discover_uncovered_providers", lambda **kw: [])
+    monkeypatch.setattr(ip, "discover_blocked_providers", lambda **kw: [])
 
     rc = proxy_cli.cmd_start(_args())
     assert rc == 0
     assert captured.get("refresh_secrets_from_bitwarden") is True
     assert captured.get("bitwarden_config") is not None
+
+
+def test_cmd_start_refuses_when_bitwarden_token_missing(hermes_home, monkeypatch):
+    """stephenschoettler #1: when credential_source=bitwarden but the
+    access-token env var is empty, cmd_start must fail-loud BEFORE
+    start_proxy can silently fall back to parent env."""
+
+    from hermes_cli.config import load_config, save_config
+    cfg = load_config()
+    cfg.setdefault("proxy", {})["enabled"] = True
+    cfg["proxy"]["credential_source"] = "bitwarden"
+    cfg["proxy"]["fail_on_uncovered_providers"] = False
+    cfg.setdefault("secrets", {})["bitwarden"] = {
+        "enabled": True,
+        "project_id": "test-proj-id",
+        "access_token_env": "BWS_ACCESS_TOKEN",
+    }
+    save_config(cfg)
+    monkeypatch.delenv("BWS_ACCESS_TOKEN", raising=False)
+
+    # Sentinel: start_proxy must NOT be called.
+    def must_not_call(**kw):
+        pytest.fail("start_proxy should not be invoked when BWS token missing")
+    monkeypatch.setattr(ip, "start_proxy", must_not_call)
+    monkeypatch.setattr(ip, "discover_uncovered_providers", lambda **kw: [])
+    monkeypatch.setattr(ip, "discover_blocked_providers", lambda **kw: [])
+
+    rc = proxy_cli.cmd_start(_args())
+    assert rc == 1
 
 
 def test_cmd_start_does_not_pass_bitwarden_refresh_when_credential_source_is_env(
@@ -335,7 +373,7 @@ def test_cmd_disable_uses_public_status_pid_not_private_read_pid(
 
 def test_cmd_config_returns_0_when_present(hermes_home, monkeypatch):
     fake = ip.ProxyStatus()
-    fake.config_path = Path("/tmp/proxy.yaml")
+    fake.config_path = hermes_home / "proxy.yaml"
     monkeypatch.setattr(ip, "get_status", lambda: fake)
     rc = proxy_cli.cmd_config(_args())
     assert rc == 0

@@ -73,6 +73,11 @@ def register_cli(parent_parser: argparse.ArgumentParser) -> None:
              "loudly if BW is unreachable rather than silently falling back.",
     )
     setup.add_argument(
+        "--no-bitwarden", action="store_true",
+        help="Explicitly switch credential_source back to env on re-setup "
+             "(only meaningful when the previous setup used --from-bitwarden).",
+    )
+    setup.add_argument(
         "--rotate-tokens", action="store_true",
         help="Mint fresh proxy tokens for every provider (default is to "
              "preserve tokens for providers that already had one — avoids "
@@ -222,10 +227,58 @@ def cmd_setup(args: argparse.Namespace) -> int:
     # egress setup` from invalidating tokens baked into already-running
     # sandboxes.
     existing = ip.load_mappings()
+    rotate = bool(getattr(args, "rotate_tokens", False))
+
+    # P3 confirmation gate: --rotate-tokens invalidates every running
+    # sandbox's proxy tokens immediately.  An accidental re-run (history
+    # scroll-back, tmux paste) is unrecoverable, so require explicit
+    # confirmation when there's something to actually rotate.  Skipped
+    # when stdin isn't a tty (CI / non-interactive use), in which case
+    # the operator passed the flag deliberately.
+    if rotate and existing:
+        import sys as _sys
+        from datetime import datetime as _dt
+        if _sys.stdin.isatty():
+            console.print(
+                "[yellow]⚠[/yellow]  --rotate-tokens will invalidate proxy "
+                "tokens in every running Hermes sandbox.  They will start "
+                "401-ing against upstreams until restarted."
+            )
+            try:
+                ans = input("Type 'rotate' to confirm: ").strip().lower()
+            except EOFError:
+                ans = ""
+            if ans != "rotate":
+                console.print("[yellow]Cancelled.[/yellow]")
+                return 1
+        # Backup the existing mappings before we overwrite.  The
+        # resulting ``.rotated-<unix>`` sibling is plain JSON and lets
+        # the operator manually recover tokens if they realise the
+        # rotation was a mistake.
+        try:
+            import shutil as _shutil
+            state_dir = ip._proxy_state_dir()
+            mappings_src = state_dir / "mappings.json"
+            if mappings_src.exists():
+                ts = _dt.now().strftime("%Y%m%dT%H%M%S")
+                backup = state_dir / f"mappings.json.rotated-{ts}"
+                _shutil.copy2(str(mappings_src), str(backup))
+                console.print(f"  [dim]backup: {backup}[/dim]")
+        except OSError as exc:
+            console.print(
+                f"  [yellow]Could not back up mappings before rotation: "
+                f"{exc}[/yellow]"
+            )
+    elif rotate and not existing:
+        console.print(
+            "[dim]Note: --rotate-tokens is a no-op on first-time setup "
+            "(no existing tokens to rotate).[/dim]"
+        )
+
     mappings = ip.merge_mappings(
         existing=existing,
         discovered=discovered,
-        rotate=bool(getattr(args, "rotate_tokens", False)),
+        rotate=rotate,
     )
 
     if not mappings:
@@ -257,16 +310,6 @@ def cmd_setup(args: argparse.Namespace) -> int:
             "  [dim]These providers use non-bearer auth (x-api-key, "
             "SigV4, etc.) and will hold real credentials inside the "
             "sandbox.  Egress isolation is INCOMPLETE for these.[/dim]"
-        )
-
-    # If we're rotating existing mappings, also surface that — the
-    # operator might be running containers that hold the old tokens.
-    if existing and getattr(args, "rotate_tokens", False):
-        console.print()
-        console.print(
-            "  [yellow]⚠[/yellow]  --rotate-tokens used: any running "
-            "Hermes sandbox holds stale tokens and will 401 against "
-            "upstreams until restarted."
         )
 
     table = Table(show_header=True, header_style="bold")
@@ -310,8 +353,15 @@ def cmd_setup(args: argparse.Namespace) -> int:
     audit_log_path = ip._proxy_state_dir() / "audit.log"
     # Pre-create the audit log with 0o600 so iron-proxy inherits private
     # perms instead of letting the daemon create it under the default
-    # umask (potentially world-readable).
-    ip.ensure_audit_log(audit_log_path)
+    # umask (potentially world-readable).  Raises on failure (planted
+    # symlink, immutable parent, full disk) — the wizard must surface
+    # that rather than print "✓" for a file the daemon will create
+    # under a slacker umask.
+    try:
+        ip.ensure_audit_log(audit_log_path)
+    except RuntimeError as exc:
+        console.print(f"  [red]✗ {exc}[/red]")
+        return 1
 
     # Allow operator override of the deny list via
     # ``proxy.upstream_deny_cidrs`` — but the default (None) gives a safe
@@ -337,7 +387,30 @@ def cmd_setup(args: argparse.Namespace) -> int:
     proxy_cfg["enabled"] = True
     proxy_cfg.setdefault("auto_install", True)
     proxy_cfg.setdefault("enforce_on_docker", True)
-    proxy_cfg["credential_source"] = "bitwarden" if args.from_bitwarden else "env"
+    # CRITICAL: do NOT silently downgrade credential_source on re-run.
+    # If the operator previously configured `bitwarden` mode (e.g. for
+    # rotation), running `hermes egress setup` again WITHOUT
+    # --from-bitwarden must not rewrite credential_source to "env" —
+    # that silently breaks the Bitwarden rotation guarantee the docs
+    # make.  Require an explicit --no-bitwarden to switch back.
+    existing_source = proxy_cfg.get("credential_source")
+    if args.from_bitwarden:
+        proxy_cfg["credential_source"] = "bitwarden"
+    elif getattr(args, "no_bitwarden", False):
+        proxy_cfg["credential_source"] = "env"
+        if existing_source == "bitwarden":
+            console.print(
+                "[yellow]Switched credential_source from bitwarden to env.[/yellow]"
+            )
+    elif existing_source == "bitwarden":
+        # Preserve the existing bitwarden mode.  Surface the decision so
+        # the operator knows we kept it.
+        console.print(
+            "[dim]Keeping credential_source=bitwarden from existing config. "
+            "Pass --no-bitwarden to switch to env-based credentials.[/dim]"
+        )
+    else:
+        proxy_cfg["credential_source"] = "env"
     proxy_cfg.setdefault("fail_on_uncovered_providers", False)
     save_config(cfg)
 
@@ -378,25 +451,68 @@ def cmd_start(args: argparse.Namespace) -> int:
         and bw_cfg is not None
         and bool(bw_cfg.get("enabled"))
     )
+    # Pass the proxy-side allow_env_fallback opt-in through to
+    # start_proxy.  This is a deliberate, documented escape hatch: when
+    # set, the daemon silently falls back to host env if BWS is
+    # unreachable, instead of raising.  Default is strict (raise).
+    if refresh_bw and bw_cfg is not None:
+        bw_cfg = dict(bw_cfg)
+        bw_cfg["allow_env_fallback"] = bool(
+            proxy_cfg.get("allow_env_fallback", False)
+        )
 
-    # fail_on_uncovered_providers: when true, refuse to start if any of
-    # the recognized non-bearer providers (Anthropic native, AWS Bedrock,
-    # Azure OpenAI, etc.) have env vars set in the host process — those
-    # would otherwise leak real credentials into the sandbox while
-    # bypassing the proxy.
+    # fail_on_uncovered_providers: when true, refuse to start if any
+    # LLM-specific non-bearer providers (Anthropic native, Azure OpenAI,
+    # Gemini) have env vars set in the host process — those would
+    # otherwise leak real credentials into the sandbox while bypassing
+    # the proxy.  Only the strict LLM-specific subset blocks; generic
+    # cloud creds (AWS_*, GOOGLE_APPLICATION_CREDENTIALS) still surface
+    # as warnings via `discover_uncovered_providers` but don't block, to
+    # avoid tripping every operator with terraform / gcloud set up.
     if bool(proxy_cfg.get("fail_on_uncovered_providers", False)):
-        uncovered = ip.discover_uncovered_providers()
-        if uncovered:
+        blocked = ip.discover_blocked_providers()
+        if blocked:
             console.print(
                 "[red]✗ Refusing to start: provider env vars present "
                 "that bypass the proxy:[/red]"
             )
-            for name in uncovered:
+            for name in blocked:
                 console.print(f"    - {name}")
             console.print(
                 "  Set `proxy.fail_on_uncovered_providers: false` in "
                 "config.yaml to start anyway (sandbox will hold real "
                 "credentials for those providers)."
+            )
+            return 1
+
+    # stephenschoettler #1: when `credential_source: bitwarden`, the
+    # operator picked BWS specifically to get the rotation guarantee —
+    # silently falling back to parent-env at start_proxy time reintroduces
+    # exactly the bug class the BW mode is supposed to defeat (host env
+    # is stale / mismatched).  Pre-check at the wizard layer so we fail
+    # loud with actionable error messages BEFORE start_proxy degrades.
+    if refresh_bw:
+        bw_access_env = (bw_cfg or {}).get("access_token_env", "BWS_ACCESS_TOKEN")
+        if not os.environ.get(bw_access_env, "").strip():
+            console.print(
+                f"[red]✗ Refusing to start: credential_source=bitwarden but "
+                f"{bw_access_env} is not set in the environment.[/red]"
+            )
+            console.print(
+                "  Either export the access token, or run "
+                "`hermes egress setup --no-bitwarden` to switch back to "
+                "env-based credentials."
+            )
+            return 1
+        if not (bw_cfg or {}).get("project_id"):
+            console.print(
+                "[red]✗ Refusing to start: credential_source=bitwarden but "
+                "secrets.bitwarden.project_id is empty.[/red]"
+            )
+            console.print(
+                "  Run `hermes secrets bitwarden setup` to configure the "
+                "project, or switch back via `hermes egress setup "
+                "--no-bitwarden`."
             )
             return 1
 

@@ -53,6 +53,7 @@ to a "bump the pinned version" loop.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -63,6 +64,7 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -132,9 +134,19 @@ _BEARER_PROVIDERS: Dict[str, Tuple[str, ...]] = {
 # Providers whose env-var names we recognize but whose API uses a non-bearer
 # auth scheme (x-api-key, AAD/OAuth, SigV4, custom signatures).  When any of
 # these env vars are present at proxy-start time AND
-# ``proxy.fail_on_uncovered_providers`` is true (default), ``start_proxy``
-# refuses to start.  Without this list the sandbox would still hold real
-# credentials for these providers and silently bypass the proxy.
+# ``proxy.fail_on_uncovered_providers`` is true (which is OFF by default),
+# ``start_proxy`` refuses to start.  Without this list the sandbox would
+# still hold real credentials for these providers and silently bypass the
+# proxy.
+#
+# The default is False because many of these env vars (AWS_*,
+# GOOGLE_APPLICATION_CREDENTIALS, GOOGLE_API_KEY) are present on most
+# developer laptops for reasons unrelated to LLM API access — defaulting to
+# refuse-start would force everyone using terraform / gcloud / aws-cli
+# alongside Hermes to either unset their cloud auth or set the flag in
+# config.yaml.  The wizard surfaces uncovered providers at setup time and
+# `hermes egress status` keeps them visible; operators who want hard
+# enforcement opt in via ``proxy.fail_on_uncovered_providers: true``.
 #
 # Bare strings here are env-var names; the proxy doesn't try to wire them up,
 # only flags their presence so the operator knows isolation is incomplete.
@@ -154,6 +166,19 @@ _NON_BEARER_PROVIDERS: Tuple[str, ...] = (
 )
 
 
+# Tier of `_NON_BEARER_PROVIDERS` that's LLM-specific enough that any
+# accidental sandbox bypass is a real isolation failure.  When
+# ``fail_on_uncovered_providers`` is true, only env vars in this tier
+# cause refuse-start; the rest are warn-only via `_NON_BEARER_PROVIDERS`.
+# Splitting this avoids tripping every operator with `AWS_PROFILE` set
+# for unrelated cloud work.
+_LLM_SPECIFIC_NON_BEARER_PROVIDERS: Tuple[str, ...] = (
+    "ANTHROPIC_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "GEMINI_API_KEY",
+)
+
+
 # Default SSRF-protection deny list applied to the proxy's outbound traffic.
 # Mirrors the public docs promise ("cloud metadata IPs are refused by default
 # regardless of allowlist").  Tests / dev setups that need loopback can pass
@@ -167,6 +192,18 @@ _DEFAULT_UPSTREAM_DENY_CIDRS: Tuple[str, ...] = (
     "172.16.0.0/12",      # RFC1918
     "192.168.0.0/16",     # RFC1918
     "fc00::/7",           # IPv6 ULA
+    # IPv4-mapped IPv6 (``::ffff:0:0/96``) covers the dual-stack case
+    # where an upstream resolves to e.g. ``::ffff:169.254.169.254`` and
+    # the kernel hands the v4-mapped form to the socket — that would
+    # otherwise be a clean SSRF bypass to IMDS through the v6 path.
+    "::ffff:0:0/96",
+    # RFC6598 / CGNAT — used by AWS VPC for shared services, K8s pod
+    # networks, many cloud overlays.  Not strictly RFC1918 but operators
+    # universally want it denied for the same reasons.
+    "100.64.0.0/10",
+    # RFC2544 benchmark range — rare in practice but occasionally used
+    # for internal services and never legitimate as an upstream.
+    "198.18.0.0/15",
 )
 
 
@@ -434,6 +471,12 @@ def install_iron_proxy(*, force: bool = False) -> Path:
         )
         os.replace(staged, target)
 
+    # Invalidate the version cache so a freshly-installed binary
+    # re-probes ``--version`` on the next ``get_status()`` call instead
+    # of returning the pre-upgrade string.  Long-lived processes that
+    # bump the pinned version via ``force=True`` need this.
+    _VERSION_CACHE.pop(str(target), None)
+
     logger.info("Installed iron-proxy %s at %s", _IRON_PROXY_VERSION, target)
     return target
 
@@ -517,7 +560,12 @@ def iron_proxy_version(binary: Path) -> str:
     except (OSError, subprocess.TimeoutExpired):
         return ""
     out = (res.stdout or res.stderr or "").strip()
-    _VERSION_CACHE[key] = out
+    # Don't cache empty output — that would poison ``hermes egress
+    # status`` for the lifetime of the process if the first probe hit a
+    # corrupt binary or a flag-rename in a newer upstream.  Re-probe on
+    # the next call instead.
+    if out:
+        _VERSION_CACHE[key] = out
     return out
 
 
@@ -663,12 +711,19 @@ def _default_http_listen(tunnel_port: int) -> List[str]:
 def _detect_docker_bridge_ip() -> Optional[str]:
     """Return the docker0 bridge IPv4, if present, else None.
 
-    Best-effort: we try ``ip -4 addr show docker0`` first, then fall back
-    to parsing ``/proc/net/route`` for the bridge IP.  Anything that fails
-    or doesn't look like an IPv4 returns None — callers handle that as
-    "no bridge bind".
+    Best-effort: we try ``ip -4 addr show docker0`` first.  Anything that
+    fails, doesn't parse as a strict IPv4, or parses as an address we
+    must NOT bind to (unspecified, loopback, multicast, reserved, public)
+    returns None — callers handle that as "no bridge bind".
+
+    SECURITY: a hostile ``ip`` shim earlier on the operator's PATH used
+    to be able to inject ``0.0.0.0`` here and re-open INADDR_ANY binding
+    that the rest of the bind-policy work explicitly closed.  We
+    validate via :mod:`ipaddress` and reject anything that isn't
+    plausibly a docker bridge IP (private + non-special).
     """
 
+    candidate: Optional[str] = None
     try:
         res = subprocess.run(  # noqa: S603 — ip is a system binary
             ["ip", "-4", "-o", "addr", "show", "docker0"],
@@ -680,13 +735,44 @@ def _detect_docker_bridge_ip() -> Optional[str]:
                 # Expected: "<n>: docker0  inet 172.17.0.1/16 ..."
                 for i, tok in enumerate(parts):
                     if tok == "inet" and i + 1 < len(parts):
-                        ip = parts[i + 1].split("/")[0]
-                        # cheap sanity: four dotted parts.
-                        if ip.count(".") == 3:
-                            return ip
+                        candidate = parts[i + 1].split("/")[0]
+                        break
+                if candidate is not None:
+                    break
     except (OSError, subprocess.TimeoutExpired):
-        pass
-    return None
+        return None
+
+    if not candidate:
+        return None
+
+    # Stdlib validation: rejects garbage strings AND special-purpose
+    # addresses that must not be used as a bind target.
+    try:
+        addr = ipaddress.IPv4Address(candidate)
+    except (ipaddress.AddressValueError, ValueError):
+        return None
+    # Reject:
+    # - 0.0.0.0 / INADDR_ANY  (is_unspecified)
+    # - 127.0.0.0/8           (is_loopback — already in deny list)
+    # - 224.0.0.0/4           (is_multicast)
+    # - 240.0.0.0/4           (is_reserved)
+    # - 169.254.0.0/16        (is_link_local — IMDS range, never docker0)
+    # - global / public IPs   (is_global — docker0 must be RFC1918)
+    if (
+        addr.is_unspecified
+        or addr.is_loopback
+        or addr.is_multicast
+        or addr.is_reserved
+        or addr.is_link_local
+        or addr.is_global
+    ):
+        logger.warning(
+            "Refusing suspicious docker bridge IP %s reported by `ip`; "
+            "skipping bridge bind.", candidate,
+        )
+        return None
+
+    return str(addr)
 
 
 def build_proxy_config(
@@ -838,6 +924,15 @@ def ensure_audit_log(audit_path: Path) -> None:
     writes — meaning every host-side request history is potentially
     world-readable.  We pre-create the file empty with 0o600 so the daemon
     inherits the tight permissions.
+
+    Raises :class:`RuntimeError` on any OSError (planted symlink,
+    immutable parent dir, full disk).  The previous version of this
+    function logged a warning and returned silently — that's the bad
+    option, because the docstring's promise of "iron-proxy inherits
+    tight permissions" depends on us actually creating the file.  When
+    the create fails, the caller MUST know about it so the wizard can
+    surface a clear error instead of printing "✓ audit log: ..." for a
+    file the daemon will create under the default umask.
     """
 
     try:
@@ -853,7 +948,11 @@ def ensure_audit_log(audit_path: Path) -> None:
         finally:
             os.close(fd)
     except OSError as exc:
-        logger.warning("Could not pre-create audit log %s: %s", audit_path, exc)
+        raise RuntimeError(
+            f"Refusing to start: could not pre-create audit log "
+            f"{audit_path} with restrictive permissions ({exc}).  "
+            f"Move or chmod any existing file at that path and retry."
+        ) from exc
 
 
 def write_proxy_config(config: Dict) -> Path:
@@ -976,7 +1075,8 @@ def discover_uncovered_providers(
 
     The wizard uses this to print a warning at setup time; ``start_proxy``
     can be configured to refuse to start when ``fail_on_uncovered_providers``
-    is true.
+    is true (see :func:`discover_blocked_providers` for the strict tier
+    that actually blocks).
     """
 
     if available_env_names is not None:
@@ -985,6 +1085,26 @@ def discover_uncovered_providers(
         names = {k for k, v in os.environ.items() if v}
 
     return [n for n in _NON_BEARER_PROVIDERS if n in names]
+
+
+def discover_blocked_providers(
+    *,
+    available_env_names: Optional[List[str]] = None,
+) -> List[str]:
+    """Return env-var names for non-bearer providers that BLOCK start.
+
+    Subset of :func:`discover_uncovered_providers` that's LLM-specific
+    enough to refuse-start when ``proxy.fail_on_uncovered_providers`` is
+    true.  Excludes generic cloud creds (AWS_*, GCP application-default)
+    that are usually present for unrelated tooling.
+    """
+
+    if available_env_names is not None:
+        names = set(available_env_names)
+    else:
+        names = {k for k, v in os.environ.items() if v}
+
+    return [n for n in _LLM_SPECIFIC_NON_BEARER_PROVIDERS if n in names]
 
 
 def merge_mappings(
@@ -1082,6 +1202,50 @@ def _pid_proc_starttime(pid: int) -> Optional[str]:
     return fields[19]
 
 
+def _persisted_nonce_path() -> Path:
+    """Path to the on-disk sibling of the pidfile that stores the nonce.
+
+    Written by ``_write_pidfile_safely`` after ``start_proxy`` plants
+    the nonce in the iron-proxy child env, read by ``_pid_alive`` in a
+    later CLI invocation (``stop`` / ``status``) so cross-process
+    PID-recycling defense holds.
+    """
+    return _proxy_state_dir_ro() / "iron-proxy.nonce"
+
+
+def _read_persisted_nonce() -> Optional[str]:
+    """Read the on-disk nonce written next to the pidfile.
+
+    Returns None when the file is missing, unreadable, or empty —
+    callers fall back to argv0 basename matching in that case.
+    """
+    p = _persisted_nonce_path()
+    try:
+        # O_NOFOLLOW: defence-in-depth against a planted symlink at the
+        # nonce path; same-uid required to plant one but worth defending
+        # since the nonce read here decides whether stop_proxy will
+        # SIGKILL a candidate PID.
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(str(p), flags)
+    except OSError:
+        return None
+    try:
+        # Ownership check — if the file isn't owned by us, ignore it.
+        # Same threat model as the pidfile uid check.
+        try:
+            st = os.fstat(fd)
+            if hasattr(os, "getuid") and st.st_uid != os.getuid():
+                return None
+        except AttributeError:
+            pass
+        data = os.read(fd, 256).decode("utf-8", errors="ignore").strip()
+        return data or None
+    finally:
+        os.close(fd)
+
+
 def _pid_alive(pid: int) -> bool:
     """Return True iff ``pid`` is alive AND is an iron-proxy process.
 
@@ -1120,12 +1284,27 @@ def _pid_alive(pid: int) -> bool:
 
     # Strong proof: nonce env var matches.  /proc/<pid>/environ is null-
     # separated KEY=VALUE pairs; substring search is safe.
+    #
+    # The nonce can come from either:
+    #   1. the module-global ``_proxy_nonce`` set during this process's
+    #      own ``start_proxy`` call (same-process case);
+    #   2. the on-disk ``iron-proxy.nonce`` file written by
+    #      ``_write_pidfile_safely``, used when ``start`` and ``stop``
+    #      run in separate CLI invocations (cross-process case).
+    # Either source provides the same defeat-PID-recycling guarantee.
+    nonce_candidates: List[str] = []
     if _proxy_nonce:
+        nonce_candidates.append(_proxy_nonce)
+    on_disk = _read_persisted_nonce()
+    if on_disk and on_disk not in nonce_candidates:
+        nonce_candidates.append(on_disk)
+    if nonce_candidates:
         try:
             env_bytes = Path(f"/proc/{pid}/environ").read_bytes()
-            needle = f"{_HERMES_IRON_PROXY_NONCE_ENV}={_proxy_nonce}".encode()
-            if needle in env_bytes:
-                return True
+            for nonce in nonce_candidates:
+                needle = f"{_HERMES_IRON_PROXY_NONCE_ENV}={nonce}".encode()
+                if needle in env_bytes:
+                    return True
         except OSError:
             pass
 
@@ -1225,15 +1404,37 @@ def start_proxy(
     # immediately after Popen (the child has its own dup).  Without the
     # close-on-success path, every restart leaked one fd in the Hermes
     # process.
-    log_fd = os.open(
-        str(log_path),
-        os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-        0o600,
-    )
+    #
+    # O_NOFOLLOW (defence-in-depth, same threat model as the pidfile
+    # path): a same-uid attacker who plants ``iron-proxy.log`` as a
+    # symlink to e.g. ``~/.ssh/authorized_keys`` would otherwise cause
+    # every restart to append daemon diagnostics to that file.
+    log_open_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    if hasattr(os, "O_NOFOLLOW"):
+        log_open_flags |= os.O_NOFOLLOW
+    try:
+        log_fd = os.open(str(log_path), log_open_flags, 0o600)
+    except OSError as exc:
+        # ELOOP from a planted symlink — refuse with a clear error.
+        raise RuntimeError(
+            f"Refusing to write iron-proxy log {log_path}: {exc}.  "
+            "Remove that path manually and retry."
+        ) from exc
     try:
         os.fchmod(log_fd, 0o600)  # tighten if file pre-existed
     except OSError:
         pass
+    # Verify ownership — same st_uid check the pidfile uses.
+    try:
+        st = os.fstat(log_fd)
+        if hasattr(os, "getuid") and st.st_uid != os.getuid():
+            os.close(log_fd)
+            raise RuntimeError(
+                f"iron-proxy log {log_path} has unexpected owner "
+                f"uid={st.st_uid}; refusing to write."
+            )
+    except AttributeError:
+        pass  # Windows
 
     try:
         # Use the fd directly via the dup mechanism; Popen will dup() it
@@ -1264,50 +1465,154 @@ def start_proxy(
         except OSError:
             pass
 
+    # Write the pidfile IMMEDIATELY after Popen, BEFORE the listening
+    # verification.  If the parent dies during the poll loop (SIGINT,
+    # OOM, kernel pause), the pidfile is still on disk so the next
+    # ``hermes egress stop`` can clean up the orphan.  Failure paths
+    # below unlink the pidfile when they kill the child.
+    pidfile = _pidfile()
+    try:
+        _write_pidfile_safely(pidfile, proc.pid)
+    except RuntimeError:
+        # Kill the orphan so we don't leave a daemon nobody can stop.
+        _kill_and_wait(proc, grace_seconds=2)
+        raise
+
     # Poll-with-timeout instead of an unconditional 5s sleep.  The Go
     # binary normally comes up in <200ms; falling through within 100ms
     # of liveness keeps Docker container creation snappy.
+    #
+    # We scope a Ctrl-C handler around the poll loop so an operator who
+    # hits Ctrl-C while waiting for ``hermes egress start`` doesn't leak
+    # an orphan with the port bound.
     tunnel_port = _read_tunnel_port_from_config() or _DEFAULT_TUNNEL_PORT
-    deadline = time.time() + _STARTUP_GRACE_SECONDS
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            tail = _tail_log(log_path, lines=20)
-            raise RuntimeError(
-                f"iron-proxy exited immediately (code {proc.returncode}). "
-                f"Last log lines:\n{tail}"
-            )
-        if _port_listening("127.0.0.1", tunnel_port):
-            break
-        time.sleep(0.1)
+    listening = False
 
+    def _interrupt_handler(_signum, _frame):  # pragma: no cover - signal path
+        # Kill the child and unlink the pidfile, then re-raise so the
+        # caller sees the interrupt.
+        _kill_and_wait(proc, grace_seconds=2)
+        try:
+            pidfile.unlink()
+        except FileNotFoundError:
+            pass
+        raise KeyboardInterrupt()
+
+    prev_sigint = None
+    prev_sigterm = None
+    install_handlers = (
+        platform.system() != "Windows"
+        and threading.current_thread() is threading.main_thread()
+    )
+    if install_handlers:
+        prev_sigint = signal.signal(signal.SIGINT, _interrupt_handler)
+        prev_sigterm = signal.signal(signal.SIGTERM, _interrupt_handler)
+    try:
+        deadline = time.time() + _STARTUP_GRACE_SECONDS
+        # Do-while shape: check listening at least once even when the
+        # grace window is 0 (test harness / synchronous fast-path).
+        while True:
+            if proc.poll() is not None:
+                tail = _tail_log(log_path, lines=20)
+                try:
+                    pidfile.unlink()
+                except FileNotFoundError:
+                    pass
+                raise RuntimeError(
+                    f"iron-proxy exited immediately (code {proc.returncode}). "
+                    f"Last log lines:\n{tail}"
+                )
+            if _port_listening("127.0.0.1", tunnel_port):
+                listening = True
+                break
+            if time.time() >= deadline:
+                break
+            time.sleep(0.1)
+    finally:
+        if install_handlers:
+            signal.signal(signal.SIGINT, prev_sigint)
+            signal.signal(signal.SIGTERM, prev_sigterm)
+
+    # Final exit check — process may have died right at deadline.
     if proc.poll() is not None:
         tail = _tail_log(log_path, lines=20)
+        try:
+            pidfile.unlink()
+        except FileNotFoundError:
+            pass
         raise RuntimeError(
             f"iron-proxy exited immediately (code {proc.returncode}). "
             f"Last log lines:\n{tail}"
         )
 
-    pidfile = _pidfile()
-    # Use os.open with O_NOFOLLOW to refuse to follow a pre-existing
-    # symlink at the pidfile path (defence-in-depth; same-uid required to
-    # plant a symlink but worth defending).  O_TRUNC clobbers any stale
-    # content.
-    open_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    # The previous version of this code treated "process still alive at
+    # deadline" as success.  That left iron-proxy running but
+    # non-listening on the port, with a pidfile pointing at it —
+    # subsequent restarts would fail with "address in use" because the
+    # orphan still held the port.  Require port-listening for success.
+    if not listening:
+        tail = _tail_log(log_path, lines=20)
+        _kill_and_wait(proc, grace_seconds=2)
+        try:
+            pidfile.unlink()
+        except FileNotFoundError:
+            pass
+        raise RuntimeError(
+            f"iron-proxy did not bind 127.0.0.1:{tunnel_port} within "
+            f"{_STARTUP_GRACE_SECONDS}s.  Process was killed.  "
+            f"Last log lines:\n{tail}"
+        )
+
+    logger.info("Started iron-proxy pid=%s config=%s", proc.pid, cfg)
+    return get_status()
+
+
+def _write_pidfile_safely(pidfile: Path, pid: int) -> None:
+    """Write ``pid`` to ``pidfile`` with O_EXCL + O_NOFOLLOW + ownership check.
+
+    O_EXCL means "another start is in progress" if the file already
+    exists with a live owner — we cleanly fail rather than racing.  When
+    the existing pidfile points at a dead pid (stale crash), we
+    explicitly unlink it before retrying once.
+
+    Side effect: also persists the in-process nonce to disk so
+    cross-CLI-invocation ``_pid_alive`` checks (start in one process,
+    stop in another) can still defeat PID recycling.
+    """
+    open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         open_flags |= os.O_NOFOLLOW
     try:
         fd = os.open(str(pidfile), open_flags, 0o600)
+    except FileExistsError:
+        # Pidfile already exists.  If it points at a live iron-proxy,
+        # caller's _read_pid + _pid_alive at the top of start_proxy
+        # should already have returned.  Reaching here means EITHER
+        # the previous _pid_alive check raced (rare; another start in
+        # flight), OR a stale pidfile survived a crash.  Discriminate
+        # and retry once with O_TRUNC if stale.
+        existing_pid = _read_pid()
+        if existing_pid and _pid_alive(existing_pid):
+            raise RuntimeError(
+                f"Another iron-proxy start appears to be in progress "
+                f"(pidfile {pidfile} -> pid {existing_pid}).  "
+                f"Run `hermes egress stop` if that proxy is stuck."
+            )
+        # Stale — unlink and retry.
+        try:
+            pidfile.unlink()
+        except FileNotFoundError:
+            pass
+        fd = os.open(str(pidfile), open_flags, 0o600)
     except OSError as exc:
-        # If the file existed as a symlink, O_NOFOLLOW returns ELOOP.
-        # Surface a clear error and let the operator clean up.
+        # ELOOP from a planted symlink at the pidfile path.
         raise RuntimeError(
             f"Refusing to write pidfile {pidfile}: {exc}.  "
             "Remove that path manually and retry."
         ) from exc
+
     try:
-        # Verify the file we just opened is owned by us.  On POSIX,
-        # st_uid mismatch means a same-uid race won and we got a hostile
-        # file — bail rather than write the pid into it.
+        # Ownership check — same st_uid pattern the log file uses.
         try:
             st = os.fstat(fd)
             if hasattr(os, "getuid") and st.st_uid != os.getuid():
@@ -1316,12 +1621,52 @@ def start_proxy(
                 )
         except AttributeError:
             pass  # Windows
-        os.write(fd, str(proc.pid).encode("utf-8"))
+        os.write(fd, str(pid).encode("utf-8"))
     finally:
         os.close(fd)
 
-    logger.info("Started iron-proxy pid=%s config=%s", proc.pid, cfg)
-    return get_status()
+    # Persist the nonce next to the pidfile (sibling, 0o600).
+    # ``stop_proxy`` in a separate CLI invocation can read this and use
+    # it to confirm the pid still refers to our binary even though the
+    # module-global ``_proxy_nonce`` is fresh in the new process.
+    if _proxy_nonce:
+        noncefile = pidfile.with_suffix(".nonce")
+        nfd = -1
+        try:
+            nopen = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            if hasattr(os, "O_NOFOLLOW"):
+                nopen |= os.O_NOFOLLOW
+            nfd = os.open(str(noncefile), nopen, 0o600)
+            os.write(nfd, _proxy_nonce.encode("utf-8"))
+        except OSError:
+            # Best-effort.  Without the nonce file we fall back to
+            # argv0-basename matching, which is what we did before.
+            pass
+        finally:
+            if nfd >= 0:
+                try:
+                    os.close(nfd)
+                except OSError:
+                    pass
+
+
+def _kill_and_wait(proc: "subprocess.Popen", *, grace_seconds: int = 2) -> None:
+    """Best-effort SIGTERM → wait → SIGKILL for a child we own."""
+    try:
+        proc.terminate()
+    except OSError:
+        return
+    try:
+        proc.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=grace_seconds)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def _build_proxy_subprocess_env(
@@ -1379,9 +1724,25 @@ def _build_proxy_subprocess_env(
                 # Only inject env names we have a mapping for — extra
                 # secrets in the BW project shouldn't leak into the proxy
                 # process unless they're going to be used by the swap.
+                missing = sorted(needed - set(secrets))
                 for n in needed:
                     if n in secrets:
                         env[n] = secrets[n]
+                if missing:
+                    # stephenschoettler #1: don't silently keep stale
+                    # host-env values when BWS mode was explicitly
+                    # selected.  An operator on credential_source=bitwarden
+                    # picked it specifically to get rotation; falling back
+                    # to parent env reintroduces the bug class the mode
+                    # is supposed to defeat.
+                    raise RuntimeError(
+                        f"Bitwarden refresh did not return secrets for "
+                        f"{missing}.  Either add the secrets to your BWS "
+                        f"project, switch to credential_source: env via "
+                        f"`hermes egress setup --no-bitwarden`, or set "
+                        f"`proxy.allow_env_fallback: true` in config.yaml "
+                        f"to opt into the legacy host-env fallback."
+                    )
                 # bws warnings are non-secret status messages (e.g. "no
                 # project found", "rate limited"), but the taint analyzer
                 # can't tell that — log the count and let the operator
@@ -1399,14 +1760,26 @@ def _build_proxy_subprocess_env(
                 # distinguish the env-var NAME from the env-var VALUE).
                 # The name is non-secret but logging it just trips the
                 # check for no real benefit.
+                if not (bitwarden_config or {}).get("allow_env_fallback"):
+                    raise RuntimeError(
+                        "credential_source=bitwarden but the access-token "
+                        "env or project_id is empty.  Either set both, "
+                        "switch to credential_source: env, or set "
+                        "`proxy.allow_env_fallback: true` to opt into "
+                        "the legacy fallback behaviour."
+                    )
                 logger.warning(
                     "credential_source=bitwarden but access-token env or "
-                    "project_id is empty — proxy will fall back to parent env",
+                    "project_id is empty — proxy will fall back to parent env "
+                    "(allow_env_fallback=true).",
                 )
-        except (ImportError, RuntimeError) as exc:
+        except (ImportError,) as exc:
+            # Truly unrecoverable import failure: log + fall through to
+            # the env path so we don't completely block start.  Callers
+            # that want strict mode can pre-check at the wizard layer.
             logger.warning(
-                "Bitwarden refresh failed at proxy start, falling back to "
-                "parent env: %s", exc,
+                "Bitwarden refresh module unavailable at proxy start, "
+                "falling back to parent env: %s", exc,
             )
 
     # Caller-supplied overrides win.  This is intentionally last so the
@@ -1428,9 +1801,19 @@ def stop_proxy() -> bool:
 
     global _proxy_nonce
 
+    def _cleanup_state_files() -> None:
+        """Best-effort cleanup of pidfile + persisted nonce."""
+        _pidfile().unlink(missing_ok=True)
+        try:
+            _persisted_nonce_path().unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
     pid = _read_pid()
     if not pid or not _pid_alive(pid):
-        _pidfile().unlink(missing_ok=True)
+        _cleanup_state_files()
         _proxy_nonce = None
         return False
 
@@ -1442,7 +1825,7 @@ def stop_proxy() -> bool:
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
-        _pidfile().unlink(missing_ok=True)
+        _cleanup_state_files()
         _proxy_nonce = None
         return False
 
@@ -1474,7 +1857,7 @@ def stop_proxy() -> bool:
             except ProcessLookupError:
                 pass
 
-    _pidfile().unlink(missing_ok=True)
+    _cleanup_state_files()
     _proxy_nonce = None
     logger.info("Stopped iron-proxy pid=%s", pid)
     return True
@@ -1569,9 +1952,23 @@ def _tail_log(path: Path, *, lines: int = 20) -> str:
 
 
 def _reset_for_tests() -> None:
-    """No-op today — kept symmetric with bitwarden._reset_cache_for_tests."""
+    """Clear module-level caches so tests get a fresh start.
 
-    return None
+    This module owns two mutable globals that need reset between tests:
+    - ``_VERSION_CACHE`` — subprocess output cache keyed by binary path.
+    - ``_proxy_nonce`` — the strong-proof token written by ``start_proxy``
+      and read by ``_pid_alive`` to defeat PID recycling.
+
+    Today the repo's tests run each file in its own subprocess (per
+    AGENTS.md) so leakage is bounded, but any in-process caller
+    (notebooks, ad-hoc scripts, ``pytest -p no:xdist``) would otherwise
+    see whichever values were probed first regardless of subsequent
+    ``install_iron_proxy(force=True)`` or ``start_proxy`` calls.
+    """
+
+    global _proxy_nonce
+    _VERSION_CACHE.clear()
+    _proxy_nonce = None
 
 
 # Make a small set of symbols available without underscored access.
@@ -1580,6 +1977,7 @@ __all__ = [
     "TokenMapping",
     "build_proxy_config",
     "discover_provider_mappings",
+    "discover_blocked_providers",
     "discover_uncovered_providers",
     "ensure_audit_log",
     "ensure_ca_cert",

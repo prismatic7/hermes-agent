@@ -122,9 +122,10 @@ hermes egress config           # print the path to proxy.yaml for debugging
 │ - HTTPS_PROXY│               │ swaps secret  │                │             │
 └──────────────┘               └──────────────┘                └─────────────┘
                                        │
-                                       │ structured audit log
+                                       │ structured per-request audit log
                                        ▼
-                              ~/.hermes/proxy/iron-proxy.log
+                              ~/.hermes/proxy/audit.log
+                              (daemon stdout/stderr at ~/.hermes/proxy/iron-proxy.log)
 ```
 
 1. Sandbox makes an HTTPS request, e.g. `POST https://openrouter.ai/v1/chat/completions` with `Authorization: Bearer hermes-proxy-openrouter-…` (the proxy token, not the real key).
@@ -133,7 +134,7 @@ hermes egress config           # print the path to proxy.yaml for debugging
 4. iron-proxy mints a leaf cert signed by our CA for `openrouter.ai`, terminates the TLS connection, inspects the request.
 5. The `secrets` transform matches the proxy-token string in the `Authorization` header and substitutes the real `OPENROUTER_API_KEY` value, sourced from iron-proxy's own environment.
 6. Request is re-encrypted and forwarded to OpenRouter.
-7. Every request is logged as a structured JSON entry to `~/.hermes/proxy/iron-proxy.log`.
+7. Every request is logged as a structured JSON entry to `~/.hermes/proxy/audit.log`.  Daemon-level diagnostics (startup, bind errors, shutdown) go to `~/.hermes/proxy/iron-proxy.log` separately.
 
 A request to a non-allowlisted host (e.g. `https://attacker.example.com/leak?key=...`) is rejected with HTTP 403 before any bytes leave the host.
 
