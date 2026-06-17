@@ -176,6 +176,11 @@ export function PetOverlayApp() {
     }
 
     if (drag.moved) {
+      // A drag cancels any deferred single-click so the composer can't pop open
+      // after you reposition the pet.
+      clearTimeout(clickTimerRef.current)
+      clickTimerRef.current = undefined
+
       // Remember the spot on the desktop (screen coords) so the pet reopens here
       // next time / after a restart.
       window.hermesDesktop?.petOverlay?.control({
