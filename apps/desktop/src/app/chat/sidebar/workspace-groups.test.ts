@@ -59,8 +59,12 @@ describe('baseName', () => {
 })
 
 describe('kanbanWorktreeDir', () => {
-  it('matches a kanban task worktree and returns its .worktrees dir', () => {
+  it('matches a kanban task worktree (t_<hex>) and returns its .worktrees dir', () => {
     expect(kanbanWorktreeDir('/repo/.worktrees/t_aaaaaaaa')).toBe('/repo/.worktrees')
+  })
+
+  it('does NOT match a user-named "New worktree" under .worktrees/ (its own lane)', () => {
+    expect(kanbanWorktreeDir('/repo/.worktrees/test-gui-stuff')).toBeNull()
   })
 
   it('returns null for non-kanban paths', () => {
@@ -130,6 +134,25 @@ describe('mergeRepoWorktreeGroups (visual enhancer)', () => {
 
     expect(mergeRepoWorktreeGroups({ id: '/repo', path: '/repo', groups }, undefined).map(g => g.label)).toEqual(['main'])
   })
+
+  it('does not add a second "main" for a linked worktree checked out on main', () => {
+    const groups = [lane({ id: '/repo::branch::main', label: 'main', isMain: true, path: '/repo', sessions: [makeSession('/repo')] })]
+    const discovered: HermesGitWorktree[] = [
+      { branch: 'main', detached: false, isMain: false, locked: false, path: '/repo/.worktrees/main-mirror' }
+    ]
+
+    expect(mergeRepoWorktreeGroups({ id: '/repo', path: '/repo', groups }, discovered).filter(g => g.label === 'main')).toHaveLength(1)
+  })
+
+  it('surfaces a user-named "New worktree" under .worktrees/ as its own lane', () => {
+    const discovered: HermesGitWorktree[] = [
+      { branch: 'hermes/test-gui-stuff', detached: false, isMain: false, locked: false, path: '/repo/.worktrees/test-gui-stuff' }
+    ]
+
+    const merged = mergeRepoWorktreeGroups({ id: '/repo', path: '/repo', groups: [] }, discovered)
+
+    expect(merged.map(g => g.label)).toContain('hermes/test-gui-stuff')
+  })
 })
 
 const makeProject = (id: string, folders: string[]): ProjectInfo => ({
@@ -159,7 +182,8 @@ describe('placeLiveSession', () => {
     // New session: cwd set to the repo, no git_repo_root/git_branch yet.
     const placement = placeLiveSession(makeSession('/www/app'), [])
 
-    expect(placement).toMatchObject({ projectId: '/www/app', repoRoot: '/www/app', laneId: '/www/app::branch::', laneLabel: 'main' })
+    // Empty branch canonicalizes to the one "main" lane (no separate ::branch:: bucket).
+    expect(placement).toMatchObject({ projectId: '/www/app', repoRoot: '/www/app', laneId: '/www/app::branch::main', laneLabel: 'main' })
   })
 
   it('routes a session under an explicit project folder to that project', () => {

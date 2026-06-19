@@ -131,6 +131,44 @@ def test_kanban_task_worktrees_collapse_into_one_bucket():
     assert _lane_ids(project)[-1] == "/repo::kanban"
 
 
+def test_user_worktree_under_dotworktrees_is_its_own_lane_not_kanban():
+    # A user "New worktree" lives at <repo>/.worktrees/<slug> (no t_ id), so it
+    # must NOT collapse into the kanban bucket — it gets its own linked lane.
+    resolve = _resolver(
+        {
+            "/repo": ("/repo", "/repo"),
+            "/repo/.worktrees/test-gui-stuff": ("/repo", "/repo/.worktrees/test-gui-stuff"),
+        }
+    )
+    sessions = [
+        _session("/repo", branch="main"),
+        _session("/repo/.worktrees/test-gui-stuff", branch="hermes/test-gui-stuff"),
+    ]
+
+    tree = pt.build_tree([], sessions, [], resolve, hydrate=True)
+    project = tree["projects"][0]
+    lanes = {g["id"]: g for repo in project["repos"] for g in repo["groups"]}
+
+    assert "/repo/.worktrees/test-gui-stuff" in lanes
+    assert not lanes["/repo/.worktrees/test-gui-stuff"].get("isKanban")
+    assert "/repo::kanban" not in lanes
+
+
+def test_unrecorded_and_recorded_main_share_one_lane():
+    # Empty git_branch (historical sessions) folds into the same trunk lane as
+    # sessions that recorded branch "main" — no duplicate "main".
+    resolve = _resolver({"/repo": ("/repo", "/repo")})
+    sessions = [_session("/repo", branch=""), _session("/repo", branch="main")]
+
+    tree = pt.build_tree([], sessions, [], resolve, hydrate=True)
+    project = tree["projects"][0]
+    main_lanes = [g for repo in project["repos"] for g in repo["groups"] if g["label"] == "main"]
+
+    assert len(main_lanes) == 1
+    assert main_lanes[0]["id"] == "/repo::branch::main"
+    assert len(main_lanes[0]["sessions"]) == 2
+
+
 def test_persisted_repo_root_used_when_no_live_probe():
     # No resolver (remote backend): fall back to the persisted git_repo_root and
     # split the main checkout by the session's recorded branch.

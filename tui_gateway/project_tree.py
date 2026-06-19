@@ -34,7 +34,10 @@ from typing import Any, Callable, Optional
 # cwd is not in a git repo (or cannot be probed, e.g. a remote backend).
 Resolve = Callable[[str], Optional[dict]]
 
-_KANBAN_DIR_RE = re.compile(r"^(.*[/\\]\.worktrees)[/\\][^/\\]+[/\\]?$")
+# Only KANBAN-TASK worktrees (`<repo>/.worktrees/t_<hex>`, the `t_…` id kanban_db
+# mints) collapse into one lane; user-named "New worktree" dirs under
+# `.worktrees/` stay as their own lanes.
+_KANBAN_DIR_RE = re.compile(r"^(.*[/\\]\.worktrees)[/\\]t_[0-9a-f]+[/\\]?$")
 _TRUNK_BRANCHES = {"main", "master", "trunk", "develop"}
 DEFAULT_BRANCH_LABEL = "main"
 
@@ -135,8 +138,10 @@ def _place(cwd: str, branch: str, resolve: Optional[Resolve], persisted_root: st
         is_main = worktree_root == repo_root or bool(info.get("is_main"))
 
         if is_main:
-            b = (branch or "").strip()
-            return _placement(repo_root, _branch_lane_id(repo_root, b), b or DEFAULT_BRANCH_LABEL, repo_root, True, False)
+            # Unrecorded branch folds into the one trunk lane, so a repo never
+            # shows two "main" lanes (recorded "main" + the empty-branch bucket).
+            b = (branch or "").strip() or DEFAULT_BRANCH_LABEL
+            return _placement(repo_root, _branch_lane_id(repo_root, b), b, repo_root, True, False)
 
         kanban_dir = kanban_worktree_dir(worktree_root)
         if kanban_dir:
@@ -151,8 +156,8 @@ def _place(cwd: str, branch: str, resolve: Optional[Resolve], persisted_root: st
         kanban_dir = kanban_worktree_dir(cwd)
         if kanban_dir:
             return _placement(persisted_root, _kanban_lane_id(persisted_root), "kanban", kanban_dir, False, True)
-        b = (branch or "").strip()
-        return _placement(persisted_root, _branch_lane_id(persisted_root, b), b or DEFAULT_BRANCH_LABEL, persisted_root, True, False)
+        b = (branch or "").strip() or DEFAULT_BRANCH_LABEL
+        return _placement(persisted_root, _branch_lane_id(persisted_root, b), b, persisted_root, True, False)
 
     return _place_by_heuristic(cwd)
 

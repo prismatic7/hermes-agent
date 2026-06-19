@@ -242,6 +242,12 @@ export function closeProjectDialog(): void {
 }
 
 // ── Git-driven worktrees ("Start work") ─────────────────────────────────────
+// Bumped after a `git worktree add`/`remove` so the sidebar's worktree-list
+// probe (useRepoWorktreeMap) refetches and the new/removed lane shows at once,
+// instead of waiting for the next scope change.
+export const $worktreeRefreshToken = atom(0)
+const bumpWorktrees = () => $worktreeRefreshToken.set($worktreeRefreshToken.get() + 1)
+
 // Spin up a fresh worktree the lightest way (`git worktree add -b`) under the
 // repo, returning where Hermes should start working. Git is the source of
 // truth; the caller starts a session in the returned path.
@@ -256,6 +262,7 @@ export async function startWorkInRepo(
   }
 
   const result = await git.worktreeAdd(repoPath, options)
+  bumpWorktrees()
 
   return { branch: result.branch, path: result.path }
 }
@@ -268,6 +275,7 @@ export async function removeWorktreePath(repoPath: string, worktreePath: string)
   }
 
   await git.worktreeRemove(repoPath, worktreePath)
+  bumpWorktrees()
 }
 
 // Reveal a project/worktree path in the OS file manager (git-GUI standard).

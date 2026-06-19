@@ -64,8 +64,11 @@ const segments = (path: string): string[] => path.replace(/[/\\]+$/, '').split(/
 /** Last path segment. */
 export const baseName = (path: string): string | undefined => segments(path).pop()
 
-/** The kanban-task worktree dir (`<repo>/.worktrees`) for a `…/.worktrees/<task>` path, else null. */
-const KANBAN_DIR_RE = /^(.*[/\\]\.worktrees)[/\\][^/\\]+[/\\]?$/
+// The `.worktrees` dir for a KANBAN-TASK worktree path, else null. Only matches
+// task worktrees (`<repo>/.worktrees/t_<hex>`, the `t_…` id kanban_db mints) so
+// the many ephemeral task worktrees collapse into one lane — while user-named
+// "New worktree" dirs (`<repo>/.worktrees/<slug>`) stay as their own lanes.
+const KANBAN_DIR_RE = /^(.*[/\\]\.worktrees)[/\\]t_[0-9a-f]+[/\\]?$/
 
 export function kanbanWorktreeDir(path: string): null | string {
   return path.match(KANBAN_DIR_RE)?.[1] ?? null
@@ -121,8 +124,10 @@ export function mergeRepoWorktreeGroups(
   const merged = [...repo.groups]
   const seenIds = new Set(merged.map(group => group.id))
   const seenPaths = new Set(merged.map(group => group.path).filter((path): path is string => Boolean(path)))
-  const hasMainLane = (branch: string) =>
-    merged.some(group => group.isMain && group.label.localeCompare(branch, undefined, { sensitivity: 'base' }) === 0)
+  // Dedupe by branch label too: a branch shows once even if it's checked out in
+  // a linked worktree AND already has a session lane (e.g. a worktree sitting on
+  // `main` must not spawn a second, empty "main" next to the trunk lane).
+  const seenLabels = new Set(merged.map(group => group.label.toLowerCase()))
 
   for (const worktree of discoveredWorktrees ?? []) {
     const wtPath = worktree.path?.trim()
@@ -131,41 +136,24 @@ export function mergeRepoWorktreeGroups(
       continue
     }
 
-    if (worktree.isMain) {
-      const branch = worktree.branch?.trim() || DEFAULT_BRANCH_LABEL
-      const id = branchLaneId(repo.id, branch)
-
-      if (seenIds.has(id) || hasMainLane(branch)) {
-        continue
-      }
-
-      merged.push({ id, isMain: true, label: branch, path: wtPath, sessions: [] })
-      seenIds.add(id)
-      seenPaths.add(wtPath)
-
-      continue
-    }
-
     // Kanban task worktrees never get their own lane — they fold into the
     // session-derived `::kanban` bucket. Listing every `git worktree list` entry
     // here is exactly what blew the sidebar up to hundreds of empty rows.
-    if (kanbanWorktreeDir(wtPath)) {
+    if (!worktree.isMain && kanbanWorktreeDir(wtPath)) {
       continue
     }
 
-    if (seenPaths.has(wtPath) || seenIds.has(wtPath)) {
+    const label = (worktree.isMain ? worktree.branch?.trim() || DEFAULT_BRANCH_LABEL : worktree.branch?.trim()) || baseName(wtPath) || wtPath
+    const id = worktree.isMain ? branchLaneId(repo.id, label) : wtPath
+
+    if (seenIds.has(id) || seenPaths.has(wtPath) || seenLabels.has(label.toLowerCase())) {
       continue
     }
 
-    merged.push({
-      id: wtPath,
-      isMain: false,
-      label: worktree.branch?.trim() || baseName(wtPath) || wtPath,
-      path: wtPath,
-      sessions: []
-    })
-    seenIds.add(wtPath)
+    merged.push({ id, isMain: worktree.isMain, label, path: wtPath, sessions: [] })
+    seenIds.add(id)
     seenPaths.add(wtPath)
+    seenLabels.add(label.toLowerCase())
   }
 
   return sortWorktreeGroups(merged)
@@ -246,13 +234,15 @@ export function placeLiveSession(session: SessionInfo, explicitProjects: Project
     projectId = repoRoot
   }
 
-  const branch = (session.git_branch || '').trim()
+  // Empty branch folds into the one trunk "main" lane (matches the backend), so
+  // overlaying never spawns a second "main".
+  const branch = (session.git_branch || '').trim() || DEFAULT_BRANCH_LABEL
 
   return {
     projectId,
     repoRoot,
     laneId: branchLaneId(repoRoot, branch),
-    laneLabel: branch || DEFAULT_BRANCH_LABEL,
+    laneLabel: branch,
     lanePath: repoRoot
   }
 }

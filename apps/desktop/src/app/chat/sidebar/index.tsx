@@ -104,6 +104,7 @@ import {
   $projectTreeLoading,
   $reposScanning,
   $scopedSessionIds,
+  $worktreeRefreshToken,
   ALL_PROJECTS,
   copyPath,
   deleteProject,
@@ -325,6 +326,8 @@ function useRepoWorktreeMap(repoPaths: string[], enabled: boolean): [Record<stri
   const [map, setMap] = useState<Record<string, HermesGitWorktree[]>>({})
   const [loading, setLoading] = useState(false)
   const key = useMemo(() => pathListKey(repoPaths), [repoPaths])
+  // Refetch when a worktree is added/removed so a new lane shows immediately.
+  const refreshToken = useStore($worktreeRefreshToken)
 
   useEffect(() => {
     const git = window.hermesDesktop?.git
@@ -364,7 +367,7 @@ function useRepoWorktreeMap(repoPaths: string[], enabled: boolean): [Record<stri
     return () => {
       cancelled = true
     }
-  }, [enabled, key, repoPaths])
+  }, [enabled, key, repoPaths, refreshToken])
 
   return [map, loading]
 }
