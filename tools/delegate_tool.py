@@ -2537,6 +2537,45 @@ def delegate_task(
 
     _parent_tool_names = list(_model_tools._last_resolved_tool_names)
 
+    # Check for federated target routing — if any task has a target field,
+    # route the entire batch to the first target machine. Mixed targets within
+    # a single delegate_task call are not supported; use separate calls.
+    _federated_target = None
+    for t in task_list:
+        tgt = t.get("target", "")
+        if tgt:
+            if _federated_target is None:
+                _federated_target = tgt
+            elif tgt != _federated_target:
+                return tool_error(
+                    f"Mixed targets in one delegate_task call: "
+                    f"'{_federated_target}' and '{tgt}'. "
+                    f"Use separate delegate_task calls for different targets."
+                )
+
+    if _federated_target:
+        # Route to federated gateway — delegate to the target machine
+        # via the federation layer. The actual routing logic lives in a
+        # skill/plugin; this hook calls a well-known entry point.
+        try:
+            from tools.federation import route_to_machine
+            result = route_to_machine(
+                target=_federated_target,
+                tasks=task_list,
+                parent_agent=parent_agent,
+            )
+            return result
+        except ImportError:
+            return tool_error(
+                f"Target '{_federated_target}' specified but federation "
+                f"layer is not installed. Install the federation skill "
+                f"or omit the 'target' field for local delegation."
+            )
+        except Exception as exc:
+            return tool_error(
+                f"Federated delegation to '{_federated_target}' failed: {exc}"
+            )
+
     # Build all child agents on the main thread (thread-safe construction)
     # Wrapped in try/finally so the global is always restored even if a
     # child build raises (otherwise _last_resolved_tool_names stays corrupted).
@@ -3492,6 +3531,10 @@ DELEGATE_TASK_SCHEMA = {
                             "type": "number",
                             "description": "Optional per-task wall-clock timeout in seconds. Overrides the global delegation.child_timeout_seconds for this subagent. Use a short timeout for quick lookups (e.g. 30) and a longer one for deep analysis (e.g. 300). Omit to inherit the global default (no timeout by default).",
                         },
+                        "target": {
+                            "type": "string",
+                            "description": "Optional machine target for federated delegation. When set, the task is routed to the named machine's gateway via the federation layer (e.g. 'horza', 'xoralundra', 'work'). When omitted (default), the task runs as a local subagent.",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -3516,6 +3559,10 @@ DELEGATE_TASK_SCHEMA = {
                     "Setting this has no effect; the parameter remains only for "
                     "backward compatibility."
                 ),
+            },
+            "target": {
+                "type": "string",
+                "description": "Optional machine target for federated delegation. When set, the task is routed to the named machine's gateway via the federation layer (e.g. 'horza', 'xoralundra', 'work'). When omitted (default), the task runs as a local subagent.",
             },
         },
         "required": [],
