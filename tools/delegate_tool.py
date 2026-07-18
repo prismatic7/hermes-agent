@@ -2,14 +2,15 @@
 """
 Delegate Tool -- Subagent Architecture
 
-Spawns child AIAgent instances with isolated context, restricted toolsets,
+Spawns child AIAgent instances with isolated context, inherited toolsets,
 and their own terminal sessions. Supports single-task and batch (parallel)
-modes. The parent blocks until all children complete.
+modes. Top-level model calls run in the background; orchestrator children
+wait for their own workers so they can synthesize the results.
 
 Each child gets:
   - A fresh conversation (no parent history)
   - Its own task_id (own terminal session, file ops cache)
-  - A restricted toolset (configurable, with blocked tools always stripped)
+  - The parent's toolsets, with child-only blocked tools stripped
   - A focused system prompt built from the delegated goal + context
 
 The parent's context only sees the delegation call and the summary result,
@@ -666,6 +667,7 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    persona: Optional[str] = None,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -674,12 +676,18 @@ def _build_child_system_prompt(
     inspiration/openclaw/src/agents/subagent-system-prompt.ts:63-95).
     The depth note is literal truth (grounded in the passed config) so
     the LLM doesn't confabulate nesting capabilities that don't exist.
+
+    When ``persona`` is provided, it is injected as a "YOUR ROLE" block
+    that specializes the subagent's behavior (e.g. "web researcher",
+    "senior engineer", "code reviewer").
     """
     parts = [
         "You are a focused subagent working on a specific delegated task.",
         "",
         f"YOUR TASK:\n{goal}",
     ]
+    if persona and persona.strip():
+        parts.append(f"\nYOUR ROLE:\n{persona.strip()}")
     if context and context.strip():
         parts.append(f"\nCONTEXT:\n{context}")
     if workspace_path and str(workspace_path).strip():
@@ -1064,6 +1072,13 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Per-task persona — injected into the child's system prompt as
+    # a "YOUR ROLE" block to specialize behavior.
+    persona: Optional[str] = None,
+    # Per-task wall-clock timeout in seconds. Overrides the global
+    # delegation.child_timeout_seconds for this child. None = inherit
+    # the global config default (which itself defaults to no timeout).
+    timeout: Optional[float] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1151,6 +1166,7 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        persona=persona,
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -1372,6 +1388,8 @@ def _build_child_agent(
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
+    # Per-task timeout override (None = inherit global config default)
+    child._delegate_timeout = timeout
     # Stable sidebar marker: delegate subagent sessions must stay out of
     # session pickers even when a parent delete orphans them (parent_session_id
     # → NULL). Mirrors /branch's ``_branched_from`` pattern — see
@@ -1926,7 +1944,9 @@ def _run_single_child(
         # Run child with an optional hard timeout (off by default —
         # result(timeout=None) blocks until the child finishes). Stuck-child
         # protection comes from the heartbeat staleness monitor instead.
-        child_timeout = _get_child_timeout()
+        # Per-task timeout (child._delegate_timeout) beats the global config.
+        _per_task_timeout = getattr(child, "_delegate_timeout", None)
+        child_timeout = _per_task_timeout if _per_task_timeout is not None else _get_child_timeout()
         # Daemon worker (tools.daemon_pool): a timed-out child is abandoned
         # below; a stdlib non-daemon worker would then block interpreter
         # exit at atexit-join time if the child never unwinds.
@@ -2391,8 +2411,8 @@ def delegate_task(
     Spawn one or more child agents to handle delegated tasks.
 
     Supports two modes:
-      - Single: provide goal (+ optional context, toolsets, role)
-      - Batch:  provide tasks array [{goal, context, toolsets, role}, ...]
+      - Single: provide goal (+ optional context and role)
+      - Batch:  provide tasks array [{goal, context, role}, ...]
 
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
@@ -2417,10 +2437,12 @@ def delegate_task(
     top_role = _normalize_role(role)
 
     # Background (async) delegation now applies to BOTH single tasks and
-    # batches. A batch simply becomes N independent async dispatches: each
-    # child runs on the daemon executor and re-enters the conversation via
-    # the completion queue on its own, carrying its own handle. There's no
-    # combined "wait for all" — fan-out is exactly N background subagents.
+    # batches. A batch is dispatched as ONE async unit: the whole fan-out runs
+    # on the daemon executor, joins on every child (see _execute_and_aggregate
+    # / dispatch_async_delegation_batch), and pushes a SINGLE completion event
+    # carrying the consolidated per-task results. It re-enters the conversation
+    # as one message once ALL children finish — the chat is not blocked while
+    # they run.
     background = is_truthy_value(background, default=False) if background is not None else False
 
     # Depth limit — configurable via delegation.max_spawn_depth,
@@ -2524,13 +2546,16 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+            # Per-task toolsets: when provided, the model can narrow which
+            # tools a subagent gets. Intersection with parent + blocked-tool
+            # stripping is handled inside _build_child_agent. None = inherit
+            # the parent's full toolset (existing behaviour).
+            per_task_toolsets = t.get("toolsets")
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
                 context=t.get("context"),
-                # Subagents always inherit the parent's toolsets; the model
-                # cannot choose or narrow them (no model-facing toolsets arg).
-                toolsets=None,
+                toolsets=per_task_toolsets,
                 model=creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
@@ -2544,6 +2569,8 @@ def delegate_task(
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
                 role=effective_role,
+                persona=t.get("persona"),
+                timeout=t.get("timeout"),
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -3272,16 +3299,16 @@ def _build_top_level_description() -> str:
         "Only the final summary is returned -- intermediate tool results "
         "never enter your context window.\n\n"
         "TWO MODES (one of 'goal' or 'tasks' is required):\n"
-        "1. Single task: provide 'goal' (+ optional context, toolsets).\n"
+        "1. Single task: provide 'goal' (+ optional context and role).\n"
         f"2. Batch (parallel): provide 'tasks' array with up to {max_children} "
         f"items concurrently for this user (configured via "
         f"delegation.max_concurrent_children in config.yaml). {nesting_clause}\n\n"
         "BOTH MODES RUN IN THE BACKGROUND. delegate_task returns immediately — "
-        "you and the user keep working, and each subagent's full result "
-        "re-enters the conversation as its own new message when it finishes. A "
-        "batch is just N independent background subagents (N handles, each "
-        "completes on its own). Do NOT wait or poll; just continue with other "
-        "work after dispatching.\n\n"
+        "you and the user keep working, and the completed result re-enters "
+        "the conversation as a new message. A "
+        "batch returns one handle, runs N subagents concurrently, and delivers "
+        "one consolidated result after ALL of them finish. Do NOT wait or poll; "
+        "just continue with other work after dispatching.\n\n"
         "WHEN TO USE delegate_task:\n"
         "- Reasoning-heavy subtasks (debugging, code review, research synthesis)\n"
         "- Tasks that would flood your context with intermediate data\n"
@@ -3321,6 +3348,7 @@ def _build_top_level_description() -> str:
         "delegation.orchestrator_enabled=false.\n"
         "- Subagent model is NOT selectable per call: children inherit the parent model (plus its fallback chain) unless you pin all subagents to a model via delegation.provider / delegation.model in config.yaml.\n"
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
+        "- Per-task fields on batch items: 'toolsets' (restrict which tools the subagent loads), 'persona' (specialize its behavior via a role description), 'timeout' (per-task wall-clock cap in seconds).\n"
         "- Results are always returned as an array, one entry per task."
     )
 
@@ -3335,6 +3363,9 @@ def _build_tasks_param_description() -> str:
         f"Batch mode: tasks to run in parallel (up to {max_children} for this "
         f"user, set via delegation.max_concurrent_children). Each gets "
         "its own subagent with isolated context and terminal session. "
+        "Per-task fields: 'goal' (required), 'context', 'role', 'toolsets' "
+        "(restrict which tools the subagent loads), 'persona' (specialize "
+        "its behavior), 'timeout' (per-task wall-clock cap in seconds). "
         "When provided, top-level goal/context/toolsets are ignored."
     )
 
@@ -3448,6 +3479,19 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "toolsets": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional toolset names to restrict this subagent to (e.g. [\"web\", \"terminal\", \"file\"]). When set, only tools from these toolsets are loaded, significantly reducing input token overhead. When omitted, the subagent inherits the parent's full toolset. Infer from the task — e.g. use [\"web\"] for research, [\"terminal\", \"file\"] for coding, [\"web\", \"terminal\", \"file\", \"delegation\"] for orchestrator tasks.",
+                        },
+                        "persona": {
+                            "type": "string",
+                            "description": "Optional role/persona description injected into the subagent's system prompt (e.g. 'web researcher — focus on finding authoritative sources, cite URLs', 'senior engineer — prioritize correctness, add error handling'). Helps specialize subagent behavior without cramming instructions into context.",
+                        },
+                        "timeout": {
+                            "type": "number",
+                            "description": "Optional per-task wall-clock timeout in seconds. Overrides the global delegation.child_timeout_seconds for this subagent. Use a short timeout for quick lookups (e.g. 30) and a longer one for deep analysis (e.g. 300). Omit to inherit the global default (no timeout by default).",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -3464,13 +3508,13 @@ DELEGATE_TASK_SCHEMA = {
             "background": {
                 "type": "boolean",
                 "description": (
-                    "DEPRECATED / IGNORED. Single-task delegations always run "
-                    "in the background automatically — you do not need to (and "
-                    "cannot) opt in or out. The result re-enters the "
-                    "conversation as a new message when the subagent finishes; "
-                    "just continue working in the meantime. Setting this has no "
-                    "effect; the parameter remains only for backward "
-                    "compatibility."
+                    "DEPRECATED / IGNORED. Top-level single and batch "
+                    "delegations run in the background automatically — you do "
+                    "not need to (and cannot) opt in or out. A single result or "
+                    "consolidated batch result re-enters the conversation when "
+                    "the work finishes; just continue working in the meantime. "
+                    "Setting this has no effect; the parameter remains only for "
+                    "backward compatibility."
                 ),
             },
         },
@@ -3488,7 +3532,8 @@ def _model_background_value(args: dict, parent_agent=None) -> bool:
 
     Delegations from the top-level agent always run in the background — the
     model does not choose. This applies to both a single task and a fan-out
-    batch (each task becomes its own independent background subagent). The one
+    batch (the whole batch is one async unit that joins on all children and
+    returns one consolidated result). The one
     exception is a delegation from an orchestrator subagent (depth > 0), which
     needs its workers' results within its own turn. The live path is
     ``run_agent._dispatch_delegate_task``; this lambda mirrors it for the rare
