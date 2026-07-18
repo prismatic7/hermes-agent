@@ -3406,7 +3406,6 @@ def _build_tasks_param_description() -> str:
         "(restrict which tools the subagent loads), 'persona' (specialize "
         "its behavior), 'timeout' (per-task wall-clock cap in seconds). "
         "When provided, top-level goal/context/toolsets are ignored."
-        "When provided, top-level goal/context/role are ignored."
     )
 
 
