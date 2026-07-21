@@ -2449,6 +2449,7 @@ def delegate_task(
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
+    target: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -2541,6 +2542,11 @@ def delegate_task(
         tasks = recovered_tasks
 
     if tasks and isinstance(tasks, list):
+        # Propagate top-level target to any batch task without its own
+        if target:
+            for t in tasks:
+                if isinstance(t, dict) and not t.get("target"):
+                    t["target"] = target
         if len(tasks) > max_children:
             return tool_error(
                 f"Too many tasks: {len(tasks)} provided, but "
@@ -2551,7 +2557,10 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "role": top_role}]
+        task = {"goal": goal, "context": context, "role": top_role}
+        if target:
+            task["target"] = target
+        task_list = [task]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
