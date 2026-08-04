@@ -98,7 +98,10 @@ def _log_signal(signum: int, frame) -> None:
             f.write("".join(traceback.format_stack(sys._current_frames().get(tid))))
 
     _append_crash_log(f"{name} received · {time.strftime('%Y-%m-%d %H:%M:%S')}", _dump)
-    print(f"[gateway-signal] {name}", file=sys.stderr, flush=True)
+    try:
+        print(f"[gateway-signal] {name}", file=sys.stderr, flush=True)
+    except OSError:
+        pass  # stderr pipe already closed — nothing to do
     # ``os._exit`` skips atexit but breaks the mid-flush deadlock; the crash log is the trail.
     timer = threading.Timer(_shutdown_grace_seconds(), lambda: os._exit(0))
     timer.daemon = True
@@ -138,7 +141,10 @@ _install_signal("SIGINT", signal.SIG_IGN)
 def _log_exit(reason: str) -> None:
     """Record why the gateway exits (every path is a silent sys.exit(0) otherwise)."""
     _append_crash_log(f"gateway exit · {time.strftime('%Y-%m-%d %H:%M:%S')} · reason={reason}")
-    print(f"[gateway-exit] {reason}", file=sys.stderr, flush=True)
+    try:
+        print(f"[gateway-exit] {reason}", file=sys.stderr, flush=True)
+    except OSError:
+        pass  # stderr pipe already closed — nothing to do
 
 
 def wait_for_mcp_discovery(timeout: "float | None" = None) -> None:
