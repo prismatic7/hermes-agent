@@ -4526,7 +4526,12 @@ def _run_job_script(
     # everything else.  We deliberately do NOT honour the file's own
     # shebang: the scripts dir is trusted, but keeping the interpreter
     # choice explicit here keeps the allowed surface small and auditable.
-    suffix = path.suffix.lower()
+    #
+    # Use the CONFIGURED name (raw) for the suffix, not the resolved
+    # target: yadm-style alternate files (foo.sh##os.Darwin) symlink the
+    # configured name to a target whose suffix is not .sh, which would
+    # otherwise misroute bash scripts to Python.
+    suffix = raw.suffix.lower()
     if suffix in {".sh", ".bash"}:
         # Resolve bash dynamically so Windows (Git Bash) and Linux/macOS
         # all work.  On native Windows without Git for Windows installed
