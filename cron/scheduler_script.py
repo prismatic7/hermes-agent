@@ -253,10 +253,13 @@ def _windows_cron_bootstrap_argv(
     return [python_exe, "-c", bootstrap, script_path]
 
 
-def _resolve_script_path(script_path: str) -> tuple[Optional[Path], Optional[str]]:
-    """Validate a job script path; ``(path, None)`` or ``(None, error)``. Scripts MUST resolve
+def _resolve_script_path(script_path: str) -> tuple[Optional[Path], Optional[Path], Optional[str]]:
+    """Validate a job script path; ``(path, raw, None)`` or ``(None, None, error)``. Scripts MUST resolve
     inside HERMES_HOME/scripts/ (relative, absolute and ``~`` paths are all validated — path
-    traversal / absolute-path injection); contract of lifecycle_guard._expand_candidate_path."""
+    traversal / absolute-path injection); contract of lifecycle_guard._expand_candidate_path.
+    ``raw`` is the un-resolved configured name (yadm-style alternate files symlink the
+    configured name to a target with a different suffix; interpreter selection must use
+    the configured name's suffix, not the resolved target's)."""
     scripts_dir = _sched._get_hermes_home() / "scripts"
     _ensure_cron_dir(scripts_dir)
     scripts_dir_resolved = scripts_dir.resolve()
@@ -270,34 +273,40 @@ def _resolve_script_path(script_path: str) -> tuple[Optional[Path], Optional[str
     # on a non-str script_path (e.g. a Path passed by a future caller) — the guard must be crash-proof even
     # though every current call site passes a plain str (#86832 review).
     if "\x00" in str(script_path):
-        return None, f"Blocked: script path contains a NUL byte: {script_path!r}"
+        return None, None, f"Blocked: script path contains a NUL byte: {script_path!r}"
     try:
         raw = _sched.Path(script_path).expanduser()
     except (ValueError, RuntimeError, OSError):
         # RuntimeError: unexpandable ``~`` (no resolvable HOME).
-        return None, f"Blocked: script path is not a valid filesystem path: {script_path!r}"
+        return None, None, f"Blocked: script path is not a valid filesystem path: {script_path!r}"
     path = raw.resolve() if raw.is_absolute() else (scripts_dir / raw).resolve()
 
     # Traversal / absolute-path / symlink escape guard — MUST stay inside HERMES_HOME/scripts/.
     try:
         path.relative_to(scripts_dir_resolved)
     except ValueError:
-        return None, (
+        return None, None, (
             f"Blocked: script path resolves outside the scripts directory "
             f"({scripts_dir_resolved}): {script_path!r}"
         )
     if not path.exists():
-        return None, f"Script not found: {path}"
+        return None, None, f"Script not found: {path}"
     if not path.is_file():
-        return None, f"Script path is not a file: {path}"
-    return path, None
+        return None, None, f"Script path is not a file: {path}"
+    return path, raw, None
 
 
-def _script_argv(path: Path) -> tuple[Optional[list[str]], dict[str, str], Optional[str]]:
+def _script_argv(path: Path, raw: Optional[Path] = None) -> tuple[Optional[list[str]], dict[str, str], Optional[str]]:
     """``(argv, env_overlay, error)`` for a validated script. Interpreter by extension — the
     shebang is deliberately NOT honoured (small, auditable surface): ``.sh``/``.bash`` → bash,
-    else ``sys.executable`` (Windows uv-venv overlay gets the .pth bootstrap)."""
-    if path.suffix.lower() in {".sh", ".bash"}:
+    else ``sys.executable`` (Windows uv-venv overlay gets the .pth bootstrap).
+
+    Use the CONFIGURED name (``raw``) for the suffix, not the resolved target:
+    yadm-style alternate files (``foo.sh##os.Darwin``) symlink the configured name to a
+    target whose suffix is not ``.sh``, which would otherwise misroute bash scripts to
+    Python."""
+    suffix = (raw or path).suffix.lower()
+    if suffix in {".sh", ".bash"}:
         # which() finds Git Bash on Windows; None there → clear error instead of a "[WinError 2]".
         _bash = shutil.which("bash") or ("/bin/bash" if os.path.isfile("/bin/bash") else None)
         if _bash is None:
@@ -327,11 +336,11 @@ def _run_job_script(
     Optional absolute path to use as the script's cwd. When set, the subprocess runs in this directory
     instead of the scripts-dir parent. See #69396.
     """
-    path, err = _resolve_script_path(script_path)
+    path, raw, err = _resolve_script_path(script_path)
     if path is None:
         return False, err
     script_timeout = _get_script_timeout()
-    argv, env_overlay, err = _script_argv(path)
+    argv, env_overlay, err = _script_argv(path, raw)
     if argv is None:
         return False, err
 
