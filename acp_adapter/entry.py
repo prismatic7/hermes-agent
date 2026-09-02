@@ -190,6 +190,23 @@ def main(argv: list[str] | None = None) -> None:
     import acp
     from .server import HermesACPAgent
 
+    # Join background plugin discovery on the main thread BEFORE the ACP
+    # server serves any session requests. The CLI launcher starts plugin
+    # discovery in a daemon thread at startup; contextpilot's register()
+    # imports run_agent from that thread. If the first session/new import
+    # of run_agent (main thread, via _make_agent) beats that thread, the
+    # two threads deadlock on the module import lock: main holds
+    # run_agent's lock while joining discovery, and discovery's
+    # contextpilot import blocks acquiring that same lock. Joining here —
+    # before the event loop serves anything — makes the ordering
+    # deterministic and bounded (the join has its own timeout).
+    try:
+        from hermes_cli.plugins import discover_plugins
+
+        discover_plugins()
+    except Exception:
+        logger.debug("Synchronous plugin discovery pre-pass failed", exc_info=True)
+
     # Windows: import the configured memory provider (and numpy) on the main thread before
     # the MCP-discovery and ACP stdin-reader threads start (hermes_cli's ~150 ms
     # plugin-discovery thread is the only one already running). A first-time
