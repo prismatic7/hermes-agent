@@ -901,8 +901,24 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         interrupted = bool(result.get("interrupted")) or cancelled
         suppress = interrupted and final_response.startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX)
         # Send the final text unless already streamed — or if a plugin hook transformed it after.
-        if final_response and conn and not suppress and (not streamed_message or result.get("response_transformed")):
-            await conn.session_update(session_id, acp.update_agent_message_text(final_response))
+        if final_response and conn and not suppress:
+            if not streamed_message:
+                await conn.session_update(session_id, acp.update_agent_message_text(final_response))
+            elif result.get("response_transformed"):
+                # A plugin hook (e.g. transform_llm_output) rewrote the response after
+                # streaming finished. The original text was already streamed chunk-by-chunk,
+                # so sending the whole transformed response again would duplicate it in the
+                # client. Send only the delta, mirroring cli._post_stream_transform_output.
+                original = result.get("pre_transform_response") or ""
+                if original and final_response.startswith(original):
+                    delta = final_response[len(original):]
+                    if delta:
+                        await conn.session_update(session_id, acp.update_agent_message_text(delta))
+                else:
+                    await conn.session_update(
+                        session_id,
+                        acp.update_agent_message_text(f"\n[Response transformed after streaming]\n{final_response}"),
+                    )
 
         # Go idle before draining so recursive prompt() calls can acquire the session.
         with state.runtime_lock:
