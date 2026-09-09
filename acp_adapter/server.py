@@ -913,16 +913,31 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         suppress = interrupted and final_response.startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX)
         # Send the final text unless already streamed — or if a plugin hook transformed it after.
         if final_response and conn and not suppress and (not streamed_message or result.get("response_transformed")):
-            update = acp.update_agent_message_text(final_response)
-            if state.message_ids is not None:
-                # A plugin-rewritten reply replaces the streamed bubble (same id); an
-                # unstreamed final response opens its own.
-                if streamed_message and result.get("response_transformed"):
-                    update.message_id = state.message_ids.last() or state.message_ids.current()
+            # A plugin hook (e.g. transform_llm_output) can rewrite the response after the original
+            # text was already streamed chunk-by-chunk. The client APPENDS every chunk sharing a
+            # messageId, so re-sending the whole transformed response would duplicate it — send only
+            # the delta, mirroring cli._post_stream_transform_output.
+            transformed_after_stream = bool(streamed_message and result.get("response_transformed"))
+            text = final_response
+            if transformed_after_stream:
+                original = result.get("pre_transform_response") or ""
+                if original and final_response.startswith(original):
+                    text = final_response[len(original):]
                 else:
-                    update.message_id = state.message_ids.current()
+                    text = f"\n[Response transformed after streaming]\n{final_response}"
+            if state.message_ids is not None:
+                if text:
+                    update = acp.update_agent_message_text(text)
+                    # A plugin-rewritten reply appends to the streamed bubble (same id); an
+                    # unstreamed final response opens its own.
+                    if transformed_after_stream:
+                        update.message_id = state.message_ids.last() or state.message_ids.current()
+                    else:
+                        update.message_id = state.message_ids.current()
+                    await conn.session_update(session_id, update)
                 state.message_ids.close()
-            await conn.session_update(session_id, update)
+            elif text:
+                await conn.session_update(session_id, acp.update_agent_message_text(text))
 
         # Go idle before draining so recursive prompt() calls can acquire the session.
         with state.runtime_lock:
