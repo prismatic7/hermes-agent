@@ -5,19 +5,33 @@
 # checkout from a background/cron process.
 #
 # ── ROLES ────────────────────────────────────────────────────────────────────
-# Exactly ONE host is the rebase authority. Every other host follows it.
+# Exactly ONE host is the merge authority. Every other host follows it.
 #
-#   leader   (sma)         rebase fork/customizations onto upstream main,
-#                          force-push main + customizations, then reset the
+#   leader   (sma)         merge upstream main into fork/customizations,
+#                          push main + customizations, then fast-forward the
 #                          live checkout to the result.
-#   follower (horza, work) NO rebase, NO push. Fetch the fork and reset the live
-#                          checkout to whatever the leader pushed.
+#   follower (horza, work) NO merge, NO push. Fetch the fork and fast-forward
+#                          the live checkout to whatever the leader pushed.
 #
-# Why the split: all three hosts used to run the rebase-and-force-push path, so
-# the customizations branch was rewritten three times a night and each host
-# raced the others on the push (the `push_fork` stale-info tolerance below is a
-# scar from that). A rebase is a single global decision — it belongs to one
-# host. Followers only ever read.
+# Why the split: all three hosts used to run the merge-and-push path, so the
+# customizations branch was rewritten three times a night and each host raced
+# the others on the push (the `push_fork` race tolerance below is a scar from
+# that). A merge/rebase resolution is a single global decision — it belongs to
+# one host. Followers only ever read.
+#
+# ── MERGE, NOT REBASE (2026-09-21) ───────────────────────────────────────────
+# This script used to rebase fork/customizations onto upstream main. That
+# strategy cannot win against a fast-moving upstream: a rebase replays every
+# carried commit, so each upstream commit touching the same region produces a
+# FRESH conflict, and the job that was green last night reddens tonight —
+# forever. Observed upstream advance through five tips in ~40 minutes
+# (297ebd506e -> 453b1dec2b -> 6ae1fab336 -> 1536e75bfe -> a23984887a) while
+# the fork sat ~39-379 commits behind.
+#
+# A merge resolves the divergence ONCE. Later upstream commits that don't
+# re-touch those regions merge cleanly, and history is never rewritten — so no
+# force-push, and the live checkout advances by fast-forward instead of
+# `reset --hard`. Merge commits in fork history are the intended cost.
 #
 # The role is NOT baked into this file. It is passed by the host-local wrapper
 # in ~/.hermes/scripts/ ($FORK_SYNC_ROLE), because this file is version-
@@ -51,10 +65,11 @@
 # Git layout (same on every host):
 #   origin = NousResearch/hermes-agent (upstream, read-only)
 #   fork   = prismatic7/hermes-agent    (our fork, writable)
-#   customizations = our custom commits rebased onto upstream main
+#   customizations = our custom commits merged with upstream main
 #
 # Safety: never touches the live checkout's working tree when dirty; aborts on
-# scratch-clone rebase conflicts; never force-resets a dirty live checkout.
+# scratch-clone merge conflicts (leaving the fork untouched); never force-pushes
+# and never force-resets a dirty live checkout.
 # Dry-run: pass --dry-run to preview without making changes.
 
 set -eo pipefail
@@ -100,18 +115,23 @@ emit() { printf '%s\n' "$*" >>"$LOG"; printf '%s\n' "$*" >&3; }
 echo "=== $TIMESTAMP (role=$ROLE dry_run=$DRY_RUN host=$HOST_LABEL) ==="
 
 fail() { echo "ERROR: $*"; emit "fork-sync[$HOST_LABEL/$ROLE] FAILED: $*"; exit 1; }
-push_fork() {  # push_fork <refspec> <label> — force-with-lease push that tolerates
-               # a same-content race: if another host pushed the IDENTICAL
-               # content first, the lease rejects us with "stale info" — accept
-               # it and continue rather than failing. Leader-only in practice
-               # (followers never push), kept as a safety net for a hand-run
-               # leader on a second host.
+push_fork() {  # push_fork <refspec> <label> — plain (non-forcing) push that
+               # tolerates a same-content race: if another host pushed the
+               # IDENTICAL content first, we are rejected because the remote
+               # moved — accept it and continue rather than failing. Leader-only
+               # in practice (followers never push), kept as a safety net for a
+               # hand-run leader on a second host.
+               #
+               # Deliberately NOT --force-with-lease: the merge workflow never
+               # rewrites fork history, so a force push would only ever discard
+               # commits. A rejection here means something genuinely needs a
+               # human, never a routine nightly rebase rewrite.
   local refspec="$1" label="$2"
-  if git -C "$SCRATCH_CLONE" push --quiet --force-with-lease fork "$refspec" 2>&1; then
+  if git -C "$SCRATCH_CLONE" push --quiet fork "$refspec" 2>&1; then
     echo "  $label <- pushed"
     return 0
   fi
-  echo "  push to $label rejected (stale info) — re-fetching to check for a race ..."
+  echo "  push to $label rejected — re-fetching to check for a race ..."
   git -C "$SCRATCH_CLONE" fetch --quiet fork customizations main 2>&1 || fail "re-fetch fork failed"
   local remote_ref local_ref
   case "$refspec" in
@@ -142,15 +162,15 @@ if [ -n "$(git -C "$HERMES_DIR" status --porcelain)" ]; then
 fi
 
 # ════════════════════════════════════════════════════════════════════════════
-# FOLLOWER PATH — read-only. Fetch the fork, reset the live checkout to it.
-# No scratch clone, no rebase, no push.
+# FOLLOWER PATH — read-only. Fetch the fork, fast-forward the live checkout.
+# No scratch clone, no merge, no push.
 # ════════════════════════════════════════════════════════════════════════════
 if [ "$ROLE" = "follower" ]; then
   echo ""
-  echo "Follower mode: pulling fork/customizations (no rebase, no push)."
+  echo "Follower mode: pulling fork/customizations (no merge, no push)."
 
   if $DRY_RUN; then
-    echo "  [DRY RUN] would fetch fork customizations and reset the live checkout"
+    echo "  [DRY RUN] would fetch fork customizations and fast-forward the live checkout"
     echo "=== done (dry run) ==="
     emit "fork-sync[$HOST_LABEL/$ROLE] DRY RUN: would pull fork/customizations"
     exit 0
@@ -171,7 +191,7 @@ if [ "$ROLE" = "follower" ]; then
 
   if [ "$LIVE_DIRTY" = "true" ]; then
     echo "  SKIP: live checkout is dirty — not touching it."
-    echo "  Manual: cd $HERMES_DIR && git stash && git fetch fork customizations && git reset --hard fork/customizations && git stash pop"
+    echo "  Manual: cd $HERMES_DIR && git stash && git fetch fork customizations && git merge --ff-only fork/customizations && git stash pop"
     echo "=== done (skipped) ==="
     emit "fork-sync[$HOST_LABEL/$ROLE] SKIPPED: live checkout dirty (fork tip $(git -C "$HERMES_DIR" rev-parse --short "$TARGET_SHA"))"
     exit 0
@@ -179,32 +199,35 @@ if [ "$ROLE" = "follower" ]; then
 
   if [ "$LIVE_BRANCH" != "customizations" ]; then
     echo "  SKIP: live checkout is on '$LIVE_BRANCH', not 'customizations' — not switching branches from cron."
-    echo "  Manual: cd $HERMES_DIR && git fetch fork customizations && git checkout customizations && git reset --hard fork/customizations"
+    echo "  Manual: cd $HERMES_DIR && git fetch fork customizations && git checkout customizations && git merge --ff-only fork/customizations"
     echo "=== done (skipped) ==="
     emit "fork-sync[$HOST_LABEL/$ROLE] SKIPPED: on branch '$LIVE_BRANCH' (fork tip $(git -C "$HERMES_DIR" rev-parse --short "$TARGET_SHA"))"
     exit 0
   fi
 
-  # The fork's customizations branch is rebuilt by rebasing on the leader every
-  # run, so its history is rewritten each night — a fast-forward is never
-  # possible. `reset --hard` is the only way across a rebase, and it is safe
-  # here because we've just confirmed the tree is clean and on the right branch.
-  if git -C "$HERMES_DIR" reset --hard fork/customizations >/dev/null 2>&1; then
-    echo "  live checkout reset -> $(git -C "$HERMES_DIR" rev-parse --short HEAD)"
+  # The leader now MERGES upstream into customizations rather than rebasing, so
+  # fork history is appended to, never rewritten — the live checkout moves
+  # forward by fast-forward and nothing on this host can be discarded.
+  # `--ff-only` refuses if a real merge would be needed (e.g. local commits on
+  # this host), which is the right call from cron: bail out and print manual
+  # steps rather than invent a merge commit here.
+  if git -C "$HERMES_DIR" merge --ff-only --quiet fork/customizations >/dev/null 2>&1; then
+    echo "  live checkout fast-forwarded -> $(git -C "$HERMES_DIR" rev-parse --short HEAD)"
     echo "  NOTE: restart Hermes for the updated code to load."
     echo ""
     echo "=== Sync complete (follower) ==="
     echo "=== done ==="
     emit "fork-sync[$HOST_LABEL/$ROLE] ok: customizations $(git -C "$HERMES_DIR" rev-parse --short "$LIVE_SHA") -> $(git -C "$HERMES_DIR" rev-parse --short HEAD)"
   else
-    echo "  SKIP: reset failed. Manual: cd $HERMES_DIR && git fetch fork customizations && git reset --hard fork/customizations"
-    fail "reset to fork/customizations failed"
+    echo "  SKIP: cannot fast-forward (local commits on this host?)."
+    echo "  Manual: cd $HERMES_DIR && git fetch fork customizations && git merge --ff-only fork/customizations"
+    fail "fast-forward to fork/customizations failed"
   fi
   exit 0
 fi
 
 # ════════════════════════════════════════════════════════════════════════════
-# LEADER PATH — the rebase authority. Everything below may mutate the fork.
+# LEADER PATH — the merge authority. Everything below may mutate the fork.
 # ════════════════════════════════════════════════════════════════════════════
 
 # ── 2. (Re)build the scratch clone ──
@@ -218,11 +241,21 @@ if [ -d "$SCRATCH_CLONE/.git" ]; then
 fi
 # Clone from the live checkout for speed (shared clone — no re-download), but
 # the live checkout's origin points at its own stale refs. Point this clone's
-# origin at the REAL upstream GitHub URL so the rebase targets true latest.
+# origin at the REAL upstream GitHub URL so the merge targets true latest.
 git clone --quiet --no-checkout --origin origin "$HERMES_DIR" "$SCRATCH_CLONE" 2>&1 \
   || fail "scratch clone failed"
 git -C "$SCRATCH_CLONE" remote set-url origin "git@github.com:NousResearch/hermes-agent.git"
 git -C "$SCRATCH_CLONE" remote add fork git@github.com:prismatic7/hermes-agent.git
+
+# Upstream violates its own .gitattributes: it declares `*.yaml text eol=lf`,
+# but the committed blob for plugin-catalog/intelligent-tool-break.yaml still
+# carries CRLF. Checking it out therefore dirties the worktree on every run and
+# aborts the sync with "local changes would be overwritten by merge" — no
+# CONFLICT line, nothing in --diff-filter=U, which makes it look like a phantom.
+# A local (uncommitted) attributes override disables EOL conversion for that
+# path only, so the worktree matches the blob byte-for-byte and stays clean.
+printf '%s\n' "plugin-catalog/intelligent-tool-break.yaml -text" \
+  >> "$SCRATCH_CLONE/.git/info/attributes"
 
 # ── 3. Fetch upstream + fork refs (read-only — always runs) ──
 echo ""
@@ -232,24 +265,31 @@ git -C "$SCRATCH_CLONE" fetch --quiet fork main customizations 2>&1 || fail "fet
 UPSTREAM_SHA="$(git -C "$SCRATCH_CLONE" rev-parse origin/main)"
 FORK_CUSTOM_SHA="$(git -C "$SCRATCH_CLONE" rev-parse fork/customizations)"
 
-# ── 4. Rebase the fork's customizations onto upstream in the scratch clone ──
+# ── 4. Merge upstream into the fork's customizations (scratch clone) ──
 # The fork's customizations branch is the source of truth (the leader may hold
-# local tweaks; the fork is authoritative). We rebase fork/customizations onto
-# the fresh origin/main here — never in the live tree.
+# local tweaks; the fork is authoritative). We merge the fresh origin/main into
+# fork/customizations here — never in the live tree.
+#
+# Why merge, not rebase: upstream moves several times an hour. A rebase replays
+# every carried commit and hits a fresh conflict each time upstream touches the
+# same region, so a nightly rebase job that is green today reddens tonight —
+# repeatedly, forever. A merge resolves the divergence ONCE; later upstream
+# commits that don't re-touch those regions merge cleanly. Merge also does not
+# rewrite fork history, so no force-push is needed.
 echo ""
-echo "Rebasing fork/customizations onto origin/main ..."
+echo "Merging origin/main into fork/customizations ..."
 echo "  upstream tip:        $(git -C "$SCRATCH_CLONE" rev-parse --short origin/main)"
 echo "  fork customizations: $(git -C "$SCRATCH_CLONE" rev-parse --short fork/customizations)"
 echo "  fork carried:        $(git -C "$SCRATCH_CLONE" rev-list --count origin/main..fork/customizations) commit(s)"
 
 # The scratch clone starts at the live checkout's own local state (which may be
 # diverged on this host), so first reset the scratch branch to exactly
-# fork/customizations. This makes the rebase correct no matter what local
+# fork/customizations. This makes the merge correct no matter what local
 # tweaks this particular machine holds.
 git -C "$SCRATCH_CLONE" checkout --quiet -B customizations fork/customizations
 # The scratch clone is disposable, so force a pristine tree — shared-clone
 # artifacts (e.g. machine-specific tracked symlinks like contributors/emails/)
-# can otherwise leave the tree "dirty" and block the rebase.
+# can otherwise leave the tree "dirty" and block the merge.
 git -C "$SCRATCH_CLONE" reset --hard --quiet HEAD
 git -C "$SCRATCH_CLONE" clean -fd --quiet
 # macOS case-insensitive-filesystem workaround: upstream used to track two
@@ -259,10 +299,10 @@ git -C "$SCRATCH_CLONE" clean -fd --quiet
 #   - If upstream STILL tracks them: mark both skip-worktree so git ignores
 #     the phantom diff.
 #   - If upstream REMOVED them (2026-08+): skip-worktree would block the
-#     rebase ("local changes would be overwritten" — the target deletes the
+#     merge ("local changes would be overwritten" — the target deletes the
 #     files). Instead drop them from the fork's customizations entirely
-#     (index + disk + removal commit) so the rebase onto origin/main can
-#     proceed. The removal commit replays cleanly (carried commits don't
+#     (index + disk + removal commit) so the merge of origin/main can
+#     proceed. The removal commit reconciles cleanly (carried commits don't
 #     touch these files) and permanently fixes the fork.
 if [[ "$(uname -s)" == "Darwin" ]]; then
   if git -C "$SCRATCH_CLONE" cat-file -e "origin/main:contributors/emails/agent@Agents-Mac-mini.local" 2>/dev/null \
@@ -281,19 +321,28 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   fi
 fi
 if $DRY_RUN; then
-  echo "  [DRY RUN] would rebase onto origin/main"
+  echo "  [DRY RUN] would merge origin/main into customizations"
 else
-  if ! git -C "$SCRATCH_CLONE" rebase --quiet --onto origin/main origin/main customizations; then
-    git -C "$SCRATCH_CLONE" rebase --abort 2>/dev/null || true
-    fail "rebase conflict onto upstream $(git -C "$SCRATCH_CLONE" rev-parse --short origin/main) — resolve manually, then re-run"
+  # Merge upstream in. `--no-edit` keeps the default merge message so the
+  # history records exactly when and what was reconciled.
+  if ! git -C "$SCRATCH_CLONE" merge --no-edit --quiet origin/main; then
+    # A conflicting merge is a real divergence needing a human decision. Abort
+    # so the scratch clone is left clean and the fork untouched — never push a
+    # half-merged tree.
+    git -C "$SCRATCH_CLONE" merge --abort 2>/dev/null || true
+    CONFLICTED="$(git -C "$SCRATCH_CLONE" diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ' ')"
+    fail "merge conflict with upstream $(git -C "$SCRATCH_CLONE" rev-parse --short origin/main)${CONFLICTED:+ on: $CONFLICTED} — resolve manually, then re-run"
   fi
-  echo "  rebased -> $(git -C "$SCRATCH_CLONE" rev-parse --short HEAD)"
+  echo "  merged -> $(git -C "$SCRATCH_CLONE" rev-parse --short HEAD)"
 fi
 
 NEW_CUSTOM_SHA="$(git -C "$SCRATCH_CLONE" rev-parse HEAD)"
 
-# Nothing to do when upstream hasn't moved and the carried set is unchanged.
-if [ "$UPSTREAM_SHA" = "$FORK_CUSTOM_SHA" ] && [ "$FORK_CUSTOM_SHA" = "$NEW_CUSTOM_SHA" ]; then
+# Nothing to do when upstream is already merged into the carried set and the
+# branch is unchanged. (With a merge workflow, "up to date" means upstream is
+# already an ancestor — not that the two SHAs are equal.)
+if git -C "$SCRATCH_CLONE" merge-base --is-ancestor origin/main customizations 2>/dev/null \
+   && [ "$FORK_CUSTOM_SHA" = "$NEW_CUSTOM_SHA" ]; then
   echo ""
   echo "Already up to date (no upstream changes, carried set unchanged)."
   echo "=== done (no update needed) ==="
@@ -307,48 +356,47 @@ echo "Syncing fork ..."
 if $DRY_RUN; then
   echo "  [DRY RUN] would push:"
   echo "    - main            -> fork/main            (force, tracks upstream)"
-  echo "    - customizations  -> fork/customizations  (rebase result)"
+  echo "    - customizations  -> fork/customizations  (merge result)"
 else
   push_fork "origin/main:main" "fork/main"
   echo "  fork/main <- origin/main ($(git -C "$SCRATCH_CLONE" rev-parse --short origin/main))"
   push_fork "HEAD:customizations" "fork/customizations"
-  echo "  fork/customizations <- rebased ($(git -C "$SCRATCH_CLONE" rev-parse --short HEAD))"
+  echo "  fork/customizations <- merged ($(git -C "$SCRATCH_CLONE" rev-parse --short HEAD))"
 fi
 
 # ── 6. Update the live checkout (only if safe) ──
-# The fork's customizations branch is rebuilt by rebasing every run, so its
-# history is rewritten each night — a fast-forward is never possible. The only
-# way to move the live checkout across a rebase is `reset --hard`. We do that
-# ONLY when the tree is clean and we're already on `customizations`. If the
-# tree is dirty or we're on another branch, we leave the live checkout alone
-# and print manual steps — never force it, never discard uncommitted work from
-# cron. (A running Hermes process keeps using its already-loaded modules until
-# restart; resetting a clean tree on disk is no more destructive than what
-# `hermes update` does, and takes effect on next restart.)
+# The merge workflow appends to fork history rather than rewriting it, so the
+# live checkout moves forward with a fast-forward — nothing can be discarded.
+# `--ff-only` refuses if a real merge would be needed, which is exactly right
+# from cron: bail out and print manual steps rather than invent a merge commit
+# on the live tree. We only touch it when the tree is clean and we're already on
+# `customizations`. (A running Hermes process keeps using its already-loaded
+# modules until restart, so this takes effect on next restart.)
 echo ""
 echo "Updating live checkout ..."
 LIVE_SKIP_REASON=""
 if $DRY_RUN; then
-  echo "  [DRY RUN] would reset live checkout to fork/customizations"
+  echo "  [DRY RUN] would fast-forward live checkout to fork/customizations"
 elif [ "$LIVE_DIRTY" = "true" ]; then
   LIVE_SKIP_REASON="live checkout dirty"
   echo "  SKIP: live checkout is dirty — not touching it."
-  echo "  Manual: cd $HERMES_DIR && git stash && git fetch fork customizations && git reset --hard fork/customizations && git stash pop"
+  echo "  Manual: cd $HERMES_DIR && git stash && git fetch fork customizations && git merge --ff-only fork/customizations && git stash pop"
 elif [ "$LIVE_BRANCH" != "customizations" ]; then
   LIVE_SKIP_REASON="on branch '$LIVE_BRANCH'"
   echo "  SKIP: live checkout is on '$LIVE_BRANCH', not 'customizations' — not switching branches from cron."
-  echo "  Manual: cd $HERMES_DIR && git fetch fork customizations && git checkout customizations && git reset --hard fork/customizations"
+  echo "  Manual: cd $HERMES_DIR && git fetch fork customizations && git checkout customizations && git merge --ff-only fork/customizations"
 elif [ "$(git -C "$HERMES_DIR" rev-parse HEAD)" = "$NEW_CUSTOM_SHA" ]; then
   echo "  live checkout already at fork/customizations ($(git -C "$HERMES_DIR" rev-parse --short HEAD))"
 else
-  # Fetch the freshly-rebased fork ref into the live checkout, then reset.
+  # Fetch the freshly-merged fork ref into the live checkout, then fast-forward.
   git -C "$HERMES_DIR" fetch --quiet fork customizations 2>&1 || fail "live fetch failed"
-  if git -C "$HERMES_DIR" reset --hard fork/customizations >/dev/null 2>&1; then
-    echo "  live checkout reset -> $(git -C "$HERMES_DIR" rev-parse --short HEAD)"
+  if git -C "$HERMES_DIR" merge --ff-only --quiet fork/customizations >/dev/null 2>&1; then
+    echo "  live checkout fast-forwarded -> $(git -C "$HERMES_DIR" rev-parse --short HEAD)"
     echo "  NOTE: restart Hermes for the updated code to load."
   else
-    LIVE_SKIP_REASON="reset failed"
-    echo "  SKIP: reset failed. Manual: cd $HERMES_DIR && git fetch fork customizations && git reset --hard fork/customizations"
+    LIVE_SKIP_REASON="fast-forward not possible"
+    echo "  SKIP: live checkout cannot fast-forward (local commits on this host?)."
+    echo "  Manual: cd $HERMES_DIR && git fetch fork customizations && git merge --ff-only fork/customizations"
   fi
 fi
 
