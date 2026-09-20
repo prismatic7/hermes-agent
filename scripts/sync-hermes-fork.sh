@@ -205,12 +205,16 @@ if [ "$ROLE" = "follower" ]; then
     exit 0
   fi
 
-  # The leader now MERGES upstream into customizations rather than rebasing, so
-  # fork history is appended to, never rewritten — the live checkout moves
-  # forward by fast-forward and nothing on this host can be discarded.
-  # `--ff-only` refuses if a real merge would be needed (e.g. local commits on
-  # this host), which is the right call from cron: bail out and print manual
-  # steps rather than invent a merge commit here.
+  # The leader normally MERGES upstream into customizations, so fork history is
+  # appended to and the live checkout moves forward by fast-forward.
+  #
+  # BUT a fork branch that was ever rebuilt (cherry-picked/rebased upstream of
+  # this run) has a tip the live checkout does not descend from, so --ff-only
+  # legitimately fails. The fork is the authority and this checkout is a
+  # deployment mirror, so fall back to `reset --hard` — but ONLY here, i.e.
+  # after confirming the tree is clean and on the right branch, and never
+  # silently: the discarded count is reported.
+  DISCARDED="$(git -C "$HERMES_DIR" rev-list --count fork/customizations..HEAD 2>/dev/null || echo '?')"
   if git -C "$HERMES_DIR" merge --ff-only --quiet fork/customizations >/dev/null 2>&1; then
     echo "  live checkout fast-forwarded -> $(git -C "$HERMES_DIR" rev-parse --short HEAD)"
     echo "  NOTE: restart Hermes for the updated code to load."
@@ -218,10 +222,19 @@ if [ "$ROLE" = "follower" ]; then
     echo "=== Sync complete (follower) ==="
     echo "=== done ==="
     emit "fork-sync[$HOST_LABEL/$ROLE] ok: customizations $(git -C "$HERMES_DIR" rev-parse --short "$LIVE_SHA") -> $(git -C "$HERMES_DIR" rev-parse --short HEAD)"
+  elif git -C "$HERMES_DIR" reset --hard --quiet fork/customizations >/dev/null 2>&1; then
+    echo "  live checkout reset -> $(git -C "$HERMES_DIR" rev-parse --short HEAD)"
+    echo "  (fork branch had been rebuilt, so no fast-forward existed; $DISCARDED"
+    echo "   local commit(s) were left behind — the fork is the authority.)"
+    echo "  NOTE: restart Hermes for the updated code to load."
+    echo ""
+    echo "=== Sync complete (follower) ==="
+    echo "=== done ==="
+    emit "fork-sync[$HOST_LABEL/$ROLE] ok (reset): customizations $(git -C "$HERMES_DIR" rev-parse --short "$LIVE_SHA") -> $(git -C "$HERMES_DIR" rev-parse --short HEAD)"
   else
-    echo "  SKIP: cannot fast-forward (local commits on this host?)."
+    echo "  SKIP: cannot advance (fast-forward and reset both failed)."
     echo "  Manual: cd $HERMES_DIR && git fetch fork customizations && git merge --ff-only fork/customizations"
-    fail "fast-forward to fork/customizations failed"
+    fail "could not update live checkout to fork/customizations"
   fi
   exit 0
 fi
