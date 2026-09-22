@@ -466,17 +466,65 @@ def verify_sqlite_integrity(
     return _done("header check passed", valid=True, size=size)
 
 
+def _canonical_watched_path(path: str) -> str:
+    """Normalized absolute path for a DB/sidecar, ignoring an unlinked ``(deleted)`` marker."""
+    return os.path.normcase(os.path.abspath(path.removesuffix(" (deleted)")))
+
+
+def _watched_db_paths(db_path: Path) -> set:
+    """*db_path* plus its ``-wal``/``-shm`` sidecars, canonicalized for holder comparison."""
+    canonical_db = _canonical_watched_path(os.fspath(db_path))
+    return {canonical_db, canonical_db + "-wal", canonical_db + "-shm"}
+
+
+def _lsof_foreign_db_holder_pids(watched: set) -> Optional[List[int]]:
+    """Holder PIDs via ``lsof`` — the macOS/BSD path (no ``/proc`` there).
+
+    ``lsof -F pn`` emits one field per line (``p<pid>``, ``n<path>``), so no column
+    guessing is needed. An unlinked-but-held sidecar shows up with a `` (deleted)``
+    suffix, which canonicalization strips. Returns None when ``lsof`` is missing or
+    fails, so callers keep their fail-closed "ownership unknown" behaviour.
+    """
+    import subprocess
+
+    own_pid = os.getpid()
+    pids: List[int] = []
+    try:
+        out = subprocess.run(
+            ["lsof", "-F", "pn", "--", *sorted(watched)],
+            capture_output=True, text=True, errors="replace",
+        ).stdout
+    except (OSError, ValueError):
+        return None
+    current: Optional[int] = None
+    for line in out.splitlines():
+        if line.startswith("p"):
+            try:
+                current = int(line[1:])
+            except ValueError:
+                current = None
+        elif line.startswith("n") and current is not None:
+            if _canonical_watched_path(line[1:]) in watched and current != own_pid:
+                pids.append(current)
+    return sorted(set(pids))
+
+
 def _foreign_db_holder_pids(db_path: Path) -> Optional[List[int]]:
     """PIDs of OTHER processes holding *db_path* or its WAL/SHM open (Linux ``/proc`` scan).
 
     An already-unlinked ``(deleted)`` sidecar — the #90950 split-brain fingerprint — still
-    counts as held. None off-Linux or when /proc fails.
-    """
-    if not sys.platform.startswith("linux"):
-        return None
+    counts as held. None when the holder scan is UNAVAILABLE, which callers must treat as
+    "ownership unknown", never as "nobody holds it".
 
-    def _canonical(path: str) -> str:
-        return os.path.normcase(os.path.abspath(path.removesuffix(" (deleted)")))
+    macOS/BSD are covered by ``lsof``: this function previously returned None on every
+    non-Linux platform, so each caller's ``if holders:`` guard was permanently falsy and
+    every sidecar-unlink path failed OPEN on macOS. That is the 2026-09-21 split-brain —
+    ``_unlink_move_restore_db`` unlinked sidecars the gateway still had open.
+    """
+    watched = _watched_db_paths(db_path)
+
+    if not sys.platform.startswith("linux"):
+        return _lsof_foreign_db_holder_pids(watched)
 
     def _holds_watched(fds: List[str], fd_dir: str) -> bool:
         for fd in fds:
@@ -484,12 +532,10 @@ def _foreign_db_holder_pids(db_path: Path) -> Optional[List[int]]:
                 target = os.readlink(f"{fd_dir}/{fd}")
             except OSError:
                 continue
-            if _canonical(target) in watched:
+            if _canonical_watched_path(target) in watched:
                 return True
         return False
 
-    canonical_db = _canonical(os.fspath(db_path))
-    watched = {canonical_db, canonical_db + "-wal", canonical_db + "-shm"}
     pids: List[int] = []
     try:
         own_pid = os.getpid()
@@ -544,6 +590,18 @@ def _unlink_move_restore_db(src: Path, dst: Path) -> bool:
     from hermes_cli.sqlite_safe_read import LiveConnectionError, offline_file_access
     try:
         holders = _foreign_db_holder_pids(dst)
+        # ``None`` means the holder scan itself was UNAVAILABLE (no lsof, lsof failed,
+        # /proc unreadable) — NOT "nobody holds it". lsof on macOS also exits 0 while
+        # warning that it "can't stat()" a stale network mount, so a partial scan can
+        # silently omit the real holder. Treating that as "no holders" is the exact
+        # macOS fail-open that produced the #90950 split-brain, so refuse instead of
+        # unlinking sidecars we cannot prove are unheld.
+        if holders is None:
+            logger.error(
+                "Refusing unlink+move restore of %s: the holder scan was UNAVAILABLE "
+                "(lsof missing/failed), so sidecar ownership is unknown. This path "
+                "unlinks live -wal/-shm and must fail closed.", dst)
+            return False
         if holders:
             logger.error("Refusing unlink+move restore of %s: process(es) %s still "
                          "hold the database or its WAL open. Stop them and retry.", dst, holders)
