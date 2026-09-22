@@ -15,11 +15,11 @@ import { Codicon } from '@/components/ui/codicon'
 import { Switch } from '@/components/ui/switch'
 import { Tip } from '@/components/ui/tooltip'
 import { $pluginRecords, type PluginRecord, setPluginEnabled } from '@/contrib/plugins-store'
-import { discoverRuntimePlugins } from '@/contrib/runtime-loader'
+import { discoverRuntimePlugins, uninstallDiskPlugin } from '@/contrib/runtime-loader'
 import type { ProfileScope } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
-import { FolderOpen, Loader2, Monitor, Package, RefreshCw } from '@/lib/icons'
+import { FolderOpen, Loader2, Monitor, Package, RefreshCw, Trash2 } from '@/lib/icons'
 import { CATALOG_ORIGIN, CATALOG_PICKER_URL } from '@/lib/plugin-catalog'
 import { cn } from '@/lib/utils'
 import {
@@ -28,12 +28,15 @@ import {
   $agentPluginsError,
   $agentPluginsStatus,
   type AgentPluginRow,
+  type AgentPluginUpdateOutcome,
   type GatewayRequest,
   isDesktopRelevantPlugin,
   loadAgentPlugins,
+  removeAgentPlugin,
   toggleAgentPlugin,
   updateAgentPlugin
 } from '@/store/agent-plugins'
+import { confirm } from '@/store/confirm'
 import { notify, notifyError } from '@/store/notifications'
 import { $paneHeightOverride, setPaneHeightOverride } from '@/store/panes'
 import { openCatalogPluginInstall } from '@/store/plugin-catalog-install'
@@ -222,7 +225,9 @@ function PackageRow({
   scopeLabel,
   busy,
   onAgentToggle,
-  onAgentUpdate
+  onAgentUpdate,
+  onAgentRemove,
+  onDesktopRemove
 }: {
   pkg: PluginPackage
   scope: null | string
@@ -230,6 +235,8 @@ function PackageRow({
   busy: boolean
   onAgentToggle: (row: AgentPluginRow, enable: boolean) => void
   onAgentUpdate: (row: AgentPluginRow) => void
+  onAgentRemove: (row: AgentPluginRow) => void
+  onDesktopRemove: (record: PluginRecord) => void
 }) {
   const { t } = useI18n()
   const p = t.skills.plugins
@@ -239,6 +246,14 @@ function PackageRow({
   const desktopOn = desktop ? desktop.status !== 'disabled' : false
   const agentOn = agent?.status === 'enabled'
   const agentToggleable = Boolean(agent?.key)
+  // Only what lives under the profile's plugins dir ("user", or "git" when it
+  // was cloned there) can be uninstalled here: bundled plugins are refused by
+  // the backend and entrypoint (pip-installed) ones go with their package.
+  const agentRemovable = agent?.source === 'user' || agent?.source === 'git'
+  // A STANDALONE desktop plugin (a folder in <HERMES_HOME>/desktop-plugins with
+  // no agent package behind it) is deleted by Electron. A unified package's
+  // desktop half is not offered here: uninstalling the agent half prunes it.
+  const desktopRemovable = desktop?.kind === 'disk' && !desktop.packageName && !agent
   // Electron's desktop-half reconcile only walks THIS machine's homes, so a
   // package installed on a remote backend can never materialize here (#114079).
   const remoteBackend = useStore($connection)?.mode === 'remote'
@@ -281,6 +296,37 @@ function PackageRow({
               </Button>
             </Tip>
           )}
+        </span>
+        {/* Same fixed-slot treatment for Uninstall: present on every row so the
+            halves line up, populated when the agent half is a user install or
+            the row is a standalone desktop plugin. */}
+        <span className="flex size-7 shrink-0 items-center justify-center">
+          {agent && agentRemovable ? (
+            <Tip label={p.uninstallTip(pkg.name, scopeLabel)}>
+              <Button
+                aria-label={`${p.uninstall}: ${pkg.name}`}
+                className="text-(--ui-text-tertiary) hover:text-(--ui-danger,#f87171)"
+                disabled={busy}
+                onClick={() => onAgentRemove(agent)}
+                size="icon"
+                variant="ghost"
+              >
+                <Trash2 className="size-3.5" />
+              </Button>
+            </Tip>
+          ) : desktop && desktopRemovable ? (
+            <Tip label={p.uninstallDesktopTip(pkg.name)}>
+              <Button
+                aria-label={`${p.uninstall}: ${pkg.name}`}
+                className="text-(--ui-text-tertiary) hover:text-(--ui-danger,#f87171)"
+                onClick={() => onDesktopRemove(desktop)}
+                size="icon"
+                variant="ghost"
+              >
+                <Trash2 className="size-3.5" />
+              </Button>
+            </Tip>
+          ) : null}
         </span>
       </div>
 
@@ -565,6 +611,24 @@ export const PluginsTab = memo(function PluginsTab({
               <PackageRow
                 busy={pkg.agent ? agentBusy(pkg.agent) : false}
                 key={pkg.key}
+                onAgentRemove={row => {
+                  void confirm({
+                    confirmLabel: p.uninstall,
+                    description: p.uninstallConfirmBody(row.name, label),
+                    destructive: true,
+                    title: p.uninstallConfirmTitle(row.name)
+                  }).then(async ok => {
+                    if (!ok) {
+                      return
+                    }
+
+                    if (await removeAgentPlugin(requestGateway, row.name, p.uninstallFailed(row.name), scope)) {
+                      notify({ kind: 'success', message: p.uninstalled(row.name) })
+                      // Prunes the app-level desktop half whose source package just went away.
+                      void rescanAll(requestGateway, scope)
+                    }
+                  })
+                }}
                 onAgentToggle={(row, enable) => {
                   if (!row.key) {
                     return
@@ -573,10 +637,52 @@ export const PluginsTab = memo(function PluginsTab({
                   void toggleAgentPlugin(requestGateway, row.key, enable, p.toggleFailed(row.name), scope)
                 }}
                 onAgentUpdate={row => {
-                  void updateAgentPlugin(requestGateway, row.name, p.updateFailed(row.name), scope).then(applied => {
-                    if (applied) {
+                  const finish = (outcome: AgentPluginUpdateOutcome) => {
+                    if (outcome.kind === 'applied') {
                       notify({ kind: 'success', message: p.updated(row.name) })
                       void rescanAll(requestGateway, scope)
+                    }
+                  }
+
+                  void updateAgentPlugin(requestGateway, row.name, p.updateFailed(row.name), scope).then(
+                    async outcome => {
+                      if (outcome.kind !== 'consent') {
+                        finish(outcome)
+
+                        return
+                      }
+
+                      // The new pin widens the plugin (tools, hooks, deps, capabilities, a Desktop
+                      // half); the backend changed nothing until the user confirms the delta.
+                      const ok = await confirm({
+                        confirmLabel: p.updateConsentConfirm,
+                        description: [p.updateConsentBody(row.name, outcome.sha), ...outcome.deltaLines].join('\n'),
+                        title: p.updateConsentTitle(row.name)
+                      })
+
+                      if (ok) {
+                        finish(await updateAgentPlugin(requestGateway, row.name, p.updateFailed(row.name), scope, true))
+                      }
+                    }
+                  )
+                }}
+                onDesktopRemove={record => {
+                  void confirm({
+                    confirmLabel: p.uninstall,
+                    description: p.uninstallDesktopConfirmBody(record.name),
+                    destructive: true,
+                    title: p.uninstallConfirmTitle(record.name)
+                  }).then(async ok => {
+                    if (!ok) {
+                      return
+                    }
+
+                    const result = await uninstallDiskPlugin(record.id)
+
+                    if (result.ok) {
+                      notify({ kind: 'success', message: p.uninstalledDesktop(record.name) })
+                    } else {
+                      notifyError(result.error, p.uninstallFailed(record.name))
                     }
                   })
                 }}
