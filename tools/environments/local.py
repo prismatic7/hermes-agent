@@ -38,8 +38,9 @@ logger = logging.getLogger(__name__)
 # --- Terminal temp-cache pruning ---
 # get_temp_dir() defaults to HERMES_HOME/cache/terminal (real storage, not tmpfs), so
 # stale artifacts don't vanish on reboot: the gateway housekeeping loop prunes hourly
-# and a once-per-process sweep covers CLI-only installs.
-TERMINAL_TEMP_MAX_AGE_HOURS = 72
+# and a once-per-process sweep covers CLI-only installs. Retention is idle-based like
+# the scratch dir: an entry goes 24h after the last write anywhere inside it.
+TERMINAL_TEMP_MAX_IDLE_HOURS = 24
 _terminal_temp_prune_lock = threading.Lock()
 _terminal_temp_pruned_once = False
 # Background artifacts come in triplets (hermes_bg_<id>.log/.pid/.exit). A live
@@ -57,9 +58,13 @@ def _default_terminal_temp_dir() -> "Path | None":
         return None
 
 
-def cleanup_terminal_temp_cache(max_age_hours: int = TERMINAL_TEMP_MAX_AGE_HOURS) -> int:
-    """Delete session temp artifacts older than *max_age_hours*; return count.
+def cleanup_terminal_temp_cache(max_age_hours: float = TERMINAL_TEMP_MAX_IDLE_HOURS) -> int:
+    """Delete session temp artifacts idle for *max_age_hours* (no write anywhere in a
+    directory's subtree; the kwarg name is the ``cleanup_*_cache`` signature the gateway
+    housekeeping loop calls every entry with); return count.
     Only the managed default dir is pruned — never a user-pointed ``terminal.temp_dir``."""
+    from hermes_constants_scratch import subtree_touched_since
+
     root = _default_terminal_temp_dir()
     if root is None:
         return 0
@@ -82,7 +87,10 @@ def cleanup_terminal_temp_cache(max_age_hours: int = TERMINAL_TEMP_MAX_AGE_HOURS
     removed = 0
     for f, mt in mtimes.items():
         m = _BG_GROUP_RE.match(f.name)
-        if (group_newest[m.group(1)] if m else mt) >= cutoff:
+        if m:
+            if group_newest[m.group(1)] >= cutoff:
+                continue
+        elif subtree_touched_since(f, cutoff):
             continue
         try:
             shutil.rmtree(f, ignore_errors=True) if f.is_dir() else f.unlink()
@@ -462,7 +470,13 @@ def _windows_bash_candidates(custom: "str | None") -> list[str]:
     candidates = list(dict.fromkeys(c for c in raw if c and os.path.isfile(c)))
     found = shutil.which("bash")
     if found and found not in candidates:
-        candidates.append(found)
+        # Skip WSL/system bash.exe (C:\Windows\System32\bash.exe or
+        # WindowsApps bash.exe) — it is a stub launcher, not a usable shell.
+        norm = os.path.normpath(found).lower()
+        if "system32" in norm or "windowsapps" in norm:
+            logger.debug("Skipping WSL/system bash.exe at %s", found)
+        else:
+            candidates.append(found)
     return candidates
 
 
@@ -785,16 +799,35 @@ def _kill_process_group_posix(proc) -> None:
         descendants = psutil.Process(proc.pid).children(recursive=True)
     except Exception:
         descendants = []
-    try:
-        os.killpg(pgid, signal.SIGTERM)  # windows-footgun: ok — POSIX only (see _IS_WINDOWS gate in caller)
-        if not _wait_for_group_exit(proc, pgid, 1.0):
-            os.killpg(pgid, signal.SIGKILL)  # windows-footgun: ok — POSIX only (see _IS_WINDOWS gate in caller)
-            _wait_for_group_exit(proc, pgid, 2.0)
-            with contextlib.suppress(subprocess.TimeoutExpired, OSError):
-                proc.wait(timeout=0.2)
-    except ProcessLookupError:
-        pass
+    if pgid == os.getpgrp():
+        # The child shares OUR group (a spawner that skipped setsid — the Darwin gateway's
+        # posix_spawn shim, #107029): killpg would signal the caller itself. Tear down by PID.
+        _kill_known_pids(proc, descendants)
+    else:
+        try:
+            os.killpg(pgid, signal.SIGTERM)  # windows-footgun: ok — POSIX only (see _IS_WINDOWS gate in caller)
+            if not _wait_for_group_exit(proc, pgid, 1.0):
+                os.killpg(pgid, signal.SIGKILL)  # windows-footgun: ok — POSIX only (see _IS_WINDOWS gate in caller)
+                _wait_for_group_exit(proc, pgid, 2.0)
+                with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                    proc.wait(timeout=0.2)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            # macOS answers killpg with EPERM (not ESRCH) once the group's only members are
+            # unreaped zombies — rg exiting between the caller's poll() and the TERM after the
+            # drain hit its limit (#116855). Nothing group-wide is signalable, and the error
+            # must not escape: the caller still owns the output it drained. Signal the known
+            # PIDs instead so a live child (a group we may not signal) cannot outlive us.
+            _kill_known_pids(proc, descendants)
     _sweep_escaped_descendants(descendants, pgid)
+
+
+def _kill_known_pids(proc, descendants) -> None:
+    """KILL the wrapper and its snapshotted descendants by PID (idempotent on zombies)."""
+    for target in (proc, *descendants):
+        with contextlib.suppress(Exception):
+            target.kill()
 
 
 def _kill_process_windows(proc) -> None:
