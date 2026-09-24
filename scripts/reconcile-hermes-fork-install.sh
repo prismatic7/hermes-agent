@@ -118,6 +118,58 @@ run_to() {  # run_to <seconds> <command...>
 say()  { printf 'fork-install[%s] %s\n' "$LABEL" "$*"; }
 note() { $QUIET || printf '  %s\n' "$*"; }
 
+# ── which installer does this venv have? ────────────────────────────────────
+# Not every host's venv carries pip, and assuming it does fails the whole
+# reconcile on the host that needs it most:
+#   sma, horza  pip is present          -> venv/bin/python -m pip install -e .
+#   work        uv-managed venv, NO pip -> uv pip install -e . --python <venv>
+# Detected once here, then both paths are driven through the same two calls
+# (regenerate with --no-deps, reconcile without) so the sequence and the
+# reasoning above hold regardless of installer.
+#
+# uv is resolved by absolute path for the same reason `timeout` is: cron's PATH
+# is minimal and will not have ~/.local/bin or /opt/homebrew/bin on it.
+INSTALLER=""
+UV_BIN=""
+if "$PY" -m pip --version >/dev/null 2>&1; then
+  INSTALLER=pip
+else
+  UV_BIN="$(command -v uv || true)"
+  if [ -z "$UV_BIN" ]; then
+    for _c in "$HOME/.local/bin/uv" /opt/homebrew/bin/uv /usr/local/bin/uv; do
+      [ -x "$_c" ] && UV_BIN="$_c" && break
+    done
+  fi
+  if [ -n "$UV_BIN" ]; then
+    INSTALLER=uv
+  else
+    say "FAILED: venv has no pip module and no uv on this host — cannot reconcile"
+    exit 2
+  fi
+fi
+
+# install_editable <--no-deps|""> — one installer-neutral entry point.
+#   --no-deps  regenerate the editable MAPPING only, leave the dep tree alone
+#   (omitted)  full install: reconcile the deps that --no-deps skipped
+# uv has no --no-input; pip needs it to stay non-interactive under cron.
+install_editable() {
+  local no_deps="$1" rc=0
+  if [ "$INSTALLER" = "pip" ]; then
+    if [ "$no_deps" = "--no-deps" ]; then
+      run_to "$2" "$PY" -m pip install -e "$REPO" --no-deps --no-input --quiet || rc=$?
+    else
+      run_to "$2" "$PY" -m pip install -e "$REPO" --no-input --quiet || rc=$?
+    fi
+  else
+    if [ "$no_deps" = "--no-deps" ]; then
+      run_to "$2" "$UV_BIN" pip install -e "$REPO" --python "$PY" --no-deps --quiet || rc=$?
+    else
+      run_to "$2" "$UV_BIN" pip install -e "$REPO" --python "$PY" --quiet || rc=$?
+    fi
+  fi
+  return "$rc"
+}
+
 # ── 0. sanity ───────────────────────────────────────────────────────────────
 if [ ! -x "$PY" ]; then
   say "FAILED: venv python missing at $PY"
@@ -191,6 +243,11 @@ cp -a "$PURELIB"/hermes_agent-*.dist-info "$BK"/ 2>/dev/null || true
 # A version snapshot makes a regression diagnosable after the fact: what was
 # installed before the mutation is the first thing anyone wants to know.
 run_to 60 "$PY" -m pip list --format=freeze > "$BK/pip-freeze-before.txt" 2>/dev/null || true
+if [ ! -s "$BK/pip-freeze-before.txt" ] && [ -n "$UV_BIN" ]; then
+  # pip-freeze needs pip too. Record the versions that matter a second way so a
+  # uv-managed host still has a post-hoc rollback reference.
+  run_to 60 "$UV_BIN" pip freeze --python "$PY" > "$BK/pip-freeze-before.txt" 2>/dev/null || true
+fi
 # Fail closed if the backup captured nothing to roll back to. A reconcile with
 # no rollback point is worse than a dirty audit.
 if ! ls "$BK"/hermes_agent-*.dist-info >/dev/null 2>&1; then
@@ -209,8 +266,8 @@ note "backup: $BK"
 # Deliberately separate from step 4 rather than folded into one command: this
 # step is the one that prevents the crash-loop, and it must hold even when the
 # network fetch in step 4 fails. Two commands, two failure domains.
-note "regenerating editable install (pip install -e . --no-deps) ..."
-if ! run_to 420 "$PY" -m pip install -e "$REPO" --no-deps --no-input --quiet > "$BK/regen.log" 2>&1; then
+note "regenerating editable install (--no-deps) ..."
+if ! install_editable --no-deps 420 > "$BK/regen.log" 2>&1; then
   say "FAILED: editable regeneration failed (see $BK/regen.log)"
   tail -6 "$BK/regen.log" 2>/dev/null | sed 's/^/  /'
   exit 1
@@ -220,8 +277,8 @@ fi
 # Full install, deliberately NOT --no-deps: step 3 skipped exactly these, and
 # they are how the 2026-09-24 gaps appeared. Every direct dep is exact-pinned
 # in pyproject, so this resolves to the reviewed set rather than drifting.
-note "reconciling dependencies (pip install -e . --no-input) ..."
-if ! run_to 600 "$PY" -m pip install -e "$REPO" --no-input --quiet > "$BK/reconcile.log" 2>&1; then
+note "reconciling dependencies (full editable install) ..."
+if ! install_editable "" 600 > "$BK/reconcile.log" 2>&1; then
   say "FAILED: dependency reconcile failed (see $BK/reconcile.log)"
   tail -6 "$BK/reconcile.log" 2>/dev/null | sed 's/^/  /'
   exit 1
