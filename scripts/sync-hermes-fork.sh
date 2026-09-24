@@ -115,6 +115,58 @@ emit() { printf '%s\n' "$*" >>"$LOG"; printf '%s\n' "$*" >&3; }
 echo "=== $TIMESTAMP (role=$ROLE dry_run=$DRY_RUN host=$HOST_LABEL) ==="
 
 fail() { echo "ERROR: $*"; emit "fork-sync[$HOST_LABEL/$ROLE] FAILED: $*"; exit 1; }
+
+# ── Post-sync install reconcile ──────────────────────────────────────────────
+# This script moves the live checkout; it does NOT make the venv match it. Two
+# incidents in two days came from exactly that gap (see
+# scripts/reconcile-hermes-fork-install.sh for the full account): a new
+# top-level package landed with no editable-finder entry -> gateway
+# crash-looped on the next restart, and dependencies added between revisions
+# were silently skipped by the `--no-deps` repair.
+#
+# It runs in the SAME run that moved the checkout, deliberately: the dangerous
+# window is between "files changed on disk" and "the venv agrees", and a
+# gateway restart inside that window is what turns a latent gap into an outage.
+# A separate follow-up job 30 minutes later would re-open it.
+#
+# LIVE_CHANGED tells the reconciler the checkout actually moved. When it did
+# not, the reconciler still audits (cheap, read-only) — that is how a
+# half-completed earlier run converges instead of wedging. It mutates only when
+# the audit is dirty.
+LIVE_CHANGED=false
+RECONCILE_NOTE=""
+reconcile_install() {
+  local script="$HERMES_DIR/scripts/reconcile-hermes-fork-install.sh"
+  if [ ! -x "$script" ]; then
+    echo "WARNING: $script is missing or not executable — install reconcile skipped."
+    RECONCILE_NOTE="; install reconcile SKIPPED (helper missing)"
+    return 0
+  fi
+  local args=(--quiet)
+  if $LIVE_CHANGED; then args+=(--sync-changed); fi
+  if $DRY_RUN; then args+=(--dry-run); fi
+  local out rc=0
+  out="$("$script" "${args[@]}" 2>&1)" || rc=$?
+  if [ -n "$out" ]; then printf '%s\n' "$out"; fi
+  if [ "$rc" -eq 0 ]; then
+    RECONCILE_NOTE="; install reconcile OK"
+  else
+    RECONCILE_NOTE="; install reconcile FAILED (rc=$rc)"
+  fi
+  return "$rc"
+}
+
+# finish <summary-text> — the single terminal act of every branch: reconcile the
+# install, emit the ONE delivered line (with the reconcile outcome appended),
+# and exit. A non-zero reconcile fails the run, because a venv that does not
+# match its checkout is exactly the state this guards against.
+finish() {
+  local rc=0
+  reconcile_install || rc=$?
+  emit "$1$RECONCILE_NOTE"
+  exit "$rc"
+}
+
 push_fork() {  # push_fork <refspec> <label> — plain (non-forcing) push that
                # tolerates a same-content race: if another host pushed the
                # IDENTICAL content first, we are rejected because the remote
@@ -172,8 +224,7 @@ if [ "$ROLE" = "follower" ]; then
   if $DRY_RUN; then
     echo "  [DRY RUN] would fetch fork customizations and fast-forward the live checkout"
     echo "=== done (dry run) ==="
-    emit "fork-sync[$HOST_LABEL/$ROLE] DRY RUN: would pull fork/customizations"
-    exit 0
+    finish "fork-sync[$HOST_LABEL/$ROLE] DRY RUN: would pull fork/customizations"
   fi
 
   git -C "$HERMES_DIR" fetch --quiet fork customizations 2>&1 || fail "fetch fork failed"
@@ -185,24 +236,21 @@ if [ "$ROLE" = "follower" ]; then
   if [ "$LIVE_SHA" = "$TARGET_SHA" ]; then
     echo "  already current — nothing to do."
     echo "=== done (no update needed) ==="
-    emit "fork-sync[$HOST_LABEL/$ROLE] no-op: already at $(git -C "$HERMES_DIR" rev-parse --short "$TARGET_SHA")"
-    exit 0
+    finish "fork-sync[$HOST_LABEL/$ROLE] no-op: already at $(git -C "$HERMES_DIR" rev-parse --short "$TARGET_SHA")"
   fi
 
   if [ "$LIVE_DIRTY" = "true" ]; then
     echo "  SKIP: live checkout is dirty — not touching it."
     echo "  Manual: cd $HERMES_DIR && git stash && git fetch fork customizations && git merge --ff-only fork/customizations && git stash pop"
     echo "=== done (skipped) ==="
-    emit "fork-sync[$HOST_LABEL/$ROLE] SKIPPED: live checkout dirty (fork tip $(git -C "$HERMES_DIR" rev-parse --short "$TARGET_SHA"))"
-    exit 0
+    finish "fork-sync[$HOST_LABEL/$ROLE] SKIPPED: live checkout dirty (fork tip $(git -C "$HERMES_DIR" rev-parse --short "$TARGET_SHA"))"
   fi
 
   if [ "$LIVE_BRANCH" != "customizations" ]; then
     echo "  SKIP: live checkout is on '$LIVE_BRANCH', not 'customizations' — not switching branches from cron."
     echo "  Manual: cd $HERMES_DIR && git fetch fork customizations && git checkout customizations && git merge --ff-only fork/customizations"
     echo "=== done (skipped) ==="
-    emit "fork-sync[$HOST_LABEL/$ROLE] SKIPPED: on branch '$LIVE_BRANCH' (fork tip $(git -C "$HERMES_DIR" rev-parse --short "$TARGET_SHA"))"
-    exit 0
+    finish "fork-sync[$HOST_LABEL/$ROLE] SKIPPED: on branch '$LIVE_BRANCH' (fork tip $(git -C "$HERMES_DIR" rev-parse --short "$TARGET_SHA"))"
   fi
 
   # The leader normally MERGES upstream into customizations, so fork history is
@@ -216,13 +264,15 @@ if [ "$ROLE" = "follower" ]; then
   # silently: the discarded count is reported.
   DISCARDED="$(git -C "$HERMES_DIR" rev-list --count fork/customizations..HEAD 2>/dev/null || echo '?')"
   if git -C "$HERMES_DIR" merge --ff-only --quiet fork/customizations >/dev/null 2>&1; then
+    LIVE_CHANGED=true
     echo "  live checkout fast-forwarded -> $(git -C "$HERMES_DIR" rev-parse --short HEAD)"
     echo "  NOTE: restart Hermes for the updated code to load."
     echo ""
     echo "=== Sync complete (follower) ==="
     echo "=== done ==="
-    emit "fork-sync[$HOST_LABEL/$ROLE] ok: customizations $(git -C "$HERMES_DIR" rev-parse --short "$LIVE_SHA") -> $(git -C "$HERMES_DIR" rev-parse --short HEAD)"
+    finish "fork-sync[$HOST_LABEL/$ROLE] ok: customizations $(git -C "$HERMES_DIR" rev-parse --short "$LIVE_SHA") -> $(git -C "$HERMES_DIR" rev-parse --short HEAD)"
   elif git -C "$HERMES_DIR" reset --hard --quiet fork/customizations >/dev/null 2>&1; then
+    LIVE_CHANGED=true
     echo "  live checkout reset -> $(git -C "$HERMES_DIR" rev-parse --short HEAD)"
     echo "  (fork branch had been rebuilt, so no fast-forward existed; $DISCARDED"
     echo "   local commit(s) were left behind — the fork is the authority.)"
@@ -230,13 +280,12 @@ if [ "$ROLE" = "follower" ]; then
     echo ""
     echo "=== Sync complete (follower) ==="
     echo "=== done ==="
-    emit "fork-sync[$HOST_LABEL/$ROLE] ok (reset): customizations $(git -C "$HERMES_DIR" rev-parse --short "$LIVE_SHA") -> $(git -C "$HERMES_DIR" rev-parse --short HEAD)"
+    finish "fork-sync[$HOST_LABEL/$ROLE] ok (reset): customizations $(git -C "$HERMES_DIR" rev-parse --short "$LIVE_SHA") -> $(git -C "$HERMES_DIR" rev-parse --short HEAD)"
   else
     echo "  SKIP: cannot advance (fast-forward and reset both failed)."
     echo "  Manual: cd $HERMES_DIR && git fetch fork customizations && git merge --ff-only fork/customizations"
     fail "could not update live checkout to fork/customizations"
   fi
-  exit 0
 fi
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -359,8 +408,7 @@ if git -C "$SCRATCH_CLONE" merge-base --is-ancestor origin/main customizations 2
   echo ""
   echo "Already up to date (no upstream changes, carried set unchanged)."
   echo "=== done (no update needed) ==="
-  emit "fork-sync[$HOST_LABEL/$ROLE] no-op: upstream and customizations unchanged at $(git -C "$SCRATCH_CLONE" rev-parse --short "$NEW_CUSTOM_SHA")"
-  exit 0
+  finish "fork-sync[$HOST_LABEL/$ROLE] no-op: upstream and customizations unchanged at $(git -C "$SCRATCH_CLONE" rev-parse --short "$NEW_CUSTOM_SHA")"
 fi
 
 # ── 5. Update fork main + push customizations ──
@@ -404,6 +452,7 @@ else
   # Fetch the freshly-merged fork ref into the live checkout, then fast-forward.
   git -C "$HERMES_DIR" fetch --quiet fork customizations 2>&1 || fail "live fetch failed"
   if git -C "$HERMES_DIR" merge --ff-only --quiet fork/customizations >/dev/null 2>&1; then
+    LIVE_CHANGED=true
     echo "  live checkout fast-forwarded -> $(git -C "$HERMES_DIR" rev-parse --short HEAD)"
     echo "  NOTE: restart Hermes for the updated code to load."
   else
@@ -426,15 +475,18 @@ echo "=== done ==="
 CARRIED="$(git -C "$SCRATCH_CLONE" rev-list --count origin/main..HEAD)"
 UP_SHORT="$(git -C "$SCRATCH_CLONE" rev-parse --short origin/main)"
 NEW_SHORT="$(git -C "$SCRATCH_CLONE" rev-parse --short HEAD)"
-if $DRY_RUN; then
-  emit "fork-sync[$HOST_LABEL/$ROLE] DRY RUN: would push customizations $NEW_SHORT onto upstream $UP_SHORT (carried: $CARRIED)"
-elif [ -n "$LIVE_SKIP_REASON" ]; then
-  emit "fork-sync[$HOST_LABEL/$ROLE] ok (fork pushed): upstream $UP_SHORT -> customizations $NEW_SHORT (carried: $CARRIED); live checkout NOT updated ($LIVE_SKIP_REASON)"
-else
-  emit "fork-sync[$HOST_LABEL/$ROLE] ok: upstream $UP_SHORT -> customizations $NEW_SHORT (carried: $CARRIED)"
-fi
 
-# Cleanup scratch clone (only on real runs; keep it for dry-run inspection)
+# Clean up the scratch clone before the terminal reconcile: it is no longer
+# needed, and a reconcile failure must not leave it behind for the next run to
+# trip over. (Dry-run keeps it for inspection.)
 if ! $DRY_RUN; then
   rm -rf "$SCRATCH_CLONE"
+fi
+
+if $DRY_RUN; then
+  finish "fork-sync[$HOST_LABEL/$ROLE] DRY RUN: would push customizations $NEW_SHORT onto upstream $UP_SHORT (carried: $CARRIED)"
+elif [ -n "$LIVE_SKIP_REASON" ]; then
+  finish "fork-sync[$HOST_LABEL/$ROLE] ok (fork pushed): upstream $UP_SHORT -> customizations $NEW_SHORT (carried: $CARRIED); live checkout NOT updated ($LIVE_SKIP_REASON)"
+else
+  finish "fork-sync[$HOST_LABEL/$ROLE] ok: upstream $UP_SHORT -> customizations $NEW_SHORT (carried: $CARRIED)"
 fi
