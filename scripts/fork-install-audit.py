@@ -67,6 +67,36 @@ def _bail(msg: str) -> NoReturn:
     sys.exit(2)
 
 
+def repo_requirements(repo: str) -> list[str]:
+    """The repo's declared runtime requirements, straight from pyproject.toml.
+
+    Deliberately NOT ``md.distribution("hermes-agent").requires``. The installed
+    dist metadata is *also* stale in exactly the case that matters: a sync that
+    moved the checkout but died before its reconcile leaves the venv describing
+    the previous revision. Auditing the new revision's declared deps against the
+    old revision's metadata would compare an old list against an old install and
+    report CLEAN — the half-completed run would never converge. The repo file is
+    the thing the venv is supposed to match, so it is the thing to compare to.
+    """
+    path = os.path.join(repo, "pyproject.toml")
+    if not os.path.isfile(path):
+        _bail("no pyproject.toml at %s" % path)
+    with open(path, "rb") as fh:
+        cfg = tomllib.load(fh)
+    try:
+        return list(cfg["project"]["dependencies"])
+    except KeyError:
+        _bail("%s declares no [project].dependencies" % path)
+
+
+def repo_version(repo: str) -> str | None:
+    try:
+        with open(os.path.join(repo, "pyproject.toml"), "rb") as fh:
+            return tomllib.load(fh).get("project", {}).get("version")
+    except OSError:
+        return None
+
+
 def declared_packages(repo: str) -> list[str]:
     """Top-level package names from [tool.setuptools.packages.find].include.
 
@@ -137,9 +167,9 @@ def resolvable(name: str) -> bool:
         return False
 
 
-def audit_dependencies(extra_requirements: list[str]):
+def audit_dependencies(extra_requirements: list[str], declared: list[str]):
     try:
-        dist = md.distribution("hermes-agent")
+        installed_ver = md.version("hermes-agent")
     except md.PackageNotFoundError:
         _bail("hermes-agent has no installed distribution metadata "
               "(the editable install is gone)")
@@ -151,7 +181,7 @@ def audit_dependencies(extra_requirements: list[str]):
     ok = 0
     missing: list[str] = []
     mismatched: list[str] = []
-    for raw in list(dist.requires or []) + extra_requirements:
+    for raw in list(declared) + extra_requirements:
         r = Requirement(raw)
         if r.marker is not None and not r.marker.evaluate():
             continue
@@ -162,7 +192,7 @@ def audit_dependencies(extra_requirements: list[str]):
             mismatched.append("%s %s wants %s" % (r.name, have, r.specifier))
         else:
             ok += 1
-    return ok, missing, mismatched
+    return ok, missing, mismatched, installed_ver
 
 
 def main() -> int:
@@ -179,8 +209,8 @@ def main() -> int:
     ap.add_argument(
         "--extra-requirements",
         default=os.environ.get("FORK_INSTALL_AUDIT_EXTRA_REQUIREMENTS", ""),
-        help="comma-separated PEP 508 requirements to audit as if the installed "
-             "dist declared them, e.g. 'snowballstemmer==3.1.1'. Proves the "
+        help="comma-separated PEP 508 requirements to audit as if the repo "
+             "declared them, e.g. 'snowballstemmer==3.1.1'. Proves the "
              "dependency check fails on the --no-deps drift it exists to catch.",
     )
     args = ap.parse_args()
@@ -189,18 +219,31 @@ def main() -> int:
     purelib = sysconfig.get_paths()["purelib"]
 
     extra_reqs = [r.strip() for r in args.extra_requirements.split(",") if r.strip()]
-    ok, missing, mismatched = audit_dependencies(extra_reqs)
+    declared_reqs = repo_requirements(repo)
+    ok, missing, mismatched, installed_ver = audit_dependencies(extra_reqs, declared_reqs)
     print("satisfied: %d | missing: %s | mismatched: %s"
           % (ok,
              "NONE" if not missing else ", ".join(missing),
              "NONE" if not mismatched else ", ".join(mismatched)))
+
+    # Dist version vs the repo revision. A stale editable install shows here as
+    # an explicit mismatch; it is the second half of the crash-loop signature in
+    # hermes-gateway-crashloop-diagnosis (a declared-but-unmapped package being
+    # the first), and it costs nothing to check.
+    want_ver = repo_version(repo)
+    ver_dirty = False
+    if want_ver and installed_ver != want_ver:
+        print("  version:      installed dist %s != repo %s" % (installed_ver, want_ver))
+        ver_dirty = True
+    else:
+        print("dist version: %s (matches repo)" % installed_ver)
 
     want = declared_packages(repo)
     for extra in (n.strip() for n in args.extra_packages.split(",")):
         if extra and extra not in want:
             want.append(extra)
 
-    dirty = bool(missing or mismatched)
+    dirty = bool(missing or mismatched or ver_dirty)
 
     mapping, where = finder_mapping(purelib)
     if mapping is None:

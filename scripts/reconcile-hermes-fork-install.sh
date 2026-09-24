@@ -194,6 +194,14 @@ if [ -z "$PURELIB" ]; then
 fi
 
 # ── 1. audit (read-only) ────────────────────────────────────────────────────
+# The auditor compares the REPO's declared requirements and package list
+# against the installed venv — not the installed dist's own metadata. That
+# distinction is what makes a half-completed run converge: after a sync that
+# moved the checkout but died before this step, the dist metadata still
+# describes the previous revision, so comparing metadata-to-metadata would
+# report CLEAN and the gap would sit there until the next sync. The repo file
+# is the target state, so the repo file is the reference.
+#
 # Neutral cwd: from inside the repo root, cwd lands on sys.path and every name
 # resolves even when the finder is broken. The auditor neutralises this itself;
 # this is belt and braces for the shell side.
