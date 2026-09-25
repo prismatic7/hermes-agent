@@ -1,6 +1,6 @@
 """Regression: the FOREIGN-holder guard must fire on macOS, not just Linux.
 
-`hermes_cli.backup._foreign_db_holder_pids` used to return ``None`` on every
+`hermes_cli.backup_restore._foreign_db_holder_pids` used to return ``None`` on every
 non-Linux platform. Its callers read that as "no holders" (``if holders:``),
 so on macOS the unlink+move restore path had NO holder protection at all: it
 would unlink a live database and its ``-wal``/``-shm`` sidecars while another
@@ -22,7 +22,7 @@ import time
 
 import pytest
 
-from hermes_cli import backup as backup_mod
+from hermes_cli import backup_restore as backup_mod
 
 
 def _make_db(path, marker):
@@ -124,8 +124,8 @@ def test_restore_refuses_to_unlink_sidecar_held_by_live_process(tmp_path):
     """The acceptance test: restore must fail closed and leave the WAL untouched.
 
     The inode-preserving ``sqlite3.backup()`` primary path is safe under a live
-    holder, so to reach the ``_unlink_move_restore_db`` fallback — the path that
-    actually unlinks sidecars — the destination header must be unreadable.
+    holder, so to reach the inlined unlink+move fallback — the path that actually
+    unlinks sidecars — the destination header must be unreadable.
     """
     dst = tmp_path / "state.db"
     src = tmp_path / "snap.db"
@@ -167,6 +167,12 @@ def test_unlink_move_restore_refuses_when_scan_unavailable(tmp_path, monkeypatch
     while warning that it "can't stat()" a stale network mount, so a partial scan can
     omit the real holder. Reading ``None`` as "no holders" is the macOS fail-open that
     produced the split-brain; the destructive unlink+move path must fail closed.
+
+    Driven through the public ``_safe_restore_db``: the unlink+move fallback is inlined
+    there, so dooming the destination header is what routes the call into it. The
+    holder connection is raw ``sqlite3``, i.e. untracked by ``sqlite_safe_read`` — so
+    the only thing that can save the WAL here is the ``None`` refusal itself, which is
+    exactly the property under test.
     """
     dst = tmp_path / "state.db"
     src = tmp_path / "snap.db"
@@ -182,9 +188,14 @@ def test_unlink_move_restore_refuses_when_scan_unavailable(tmp_path, monkeypatch
         assert wal.exists()
         wal_ino = wal.stat().st_ino
 
+        # Doom the destination header so the inode-preserving backup() API fails and
+        # the restore routes into the unlink+move fallback (see the sibling test).
+        with open(dst, "r+b") as fh:
+            fh.write(b"\x00" * 100)
+
         monkeypatch.setattr(backup_mod, "_foreign_db_holder_pids", lambda _p: None)
 
-        assert backup_mod._unlink_move_restore_db(src, dst) is False
+        assert backup_mod._safe_restore_db(src, dst) is False
         # Nothing was unlinked: the live generation is intact.
         assert wal.exists() and wal.stat().st_ino == wal_ino
     finally:
