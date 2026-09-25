@@ -54,7 +54,7 @@ def _lsof_foreign_db_holder_pids(watched: set) -> Optional[List[int]]:
     try:
         out = subprocess.run(
             ["lsof", "-F", "pn", "--", *sorted(watched)],
-            capture_output=True, text=True, errors="replace",
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
         ).stdout
     except (OSError, ValueError):
         return None
