@@ -534,7 +534,7 @@ _nous_caps_disk_checked = False
 _nous_caps_warm_started = False
 
 
-from agent.reasoning_effort import clamp_effort as _clamp_effort, is_astra_model
+from agent.reasoning_effort import CODEX_ASTRA_EFFORTS, clamp_effort as _clamp_effort, is_astra_model
 
 
 def clamp_reasoning_effort_to_supported(
@@ -543,6 +543,18 @@ def clamp_reasoning_effort_to_supported(
     else the nearest WEAKER supported level (never silently escalate cost), else the weakest; unknown
     supported-sets and bespoke level names pass through unchanged."""
     return _clamp_effort(effort, supported_efforts)
+
+
+def clamp_github_reasoning_effort(effort: Any, supported: list[str]) -> str:
+    """Copilot/GitHub Models effort for a non-empty *supported* list: the level itself when listed,
+    else the nearest WEAKER listed level; bespoke names the ladder can't place fall to ``medium``
+    (or the first listed level)."""
+    effort = str(effort or "medium").strip().lower()
+    if effort not in supported:
+        effort = _clamp_effort(effort, supported)
+        if effort not in supported:
+            effort = "medium" if "medium" in supported else supported[0]
+    return effort
 
 
 def _fetch_live_catalog_index(url: str, timeout: float, opener) -> Optional[tuple[list, dict[str, dict[str, Any]]]]:
@@ -2352,6 +2364,8 @@ def _github_reasoning_efforts_for_model_id(model_id: str) -> list[str]:
     if raw.startswith(("openai/o1", "openai/o3", "openai/o4", "o1", "o3", "o4")):
         return list(COPILOT_REASONING_EFFORTS_O_SERIES)
     normalized = normalize_copilot_model_id(model_id).lower()
+    if is_astra_model(normalized):
+        return list(CODEX_ASTRA_EFFORTS)
     if normalized.startswith("gpt-5"):
         return list(COPILOT_REASONING_EFFORTS_GPT5)
     return []
