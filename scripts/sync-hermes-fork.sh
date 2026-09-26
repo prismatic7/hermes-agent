@@ -309,6 +309,35 @@ git clone --quiet --no-checkout --origin origin "$HERMES_DIR" "$SCRATCH_CLONE" 2
 git -C "$SCRATCH_CLONE" remote set-url origin "git@github.com:NousResearch/hermes-agent.git"
 git -C "$SCRATCH_CLONE" remote add fork git@github.com:prismatic7/hermes-agent.git
 
+# ── Partial-clone inheritance ───────────────────────────────────────────────
+# `git clone <local path>` does NOT carry the source's partial-clone settings:
+# the clone lands with repositoryformatversion=0 and no `remote.origin.promisor`,
+# so git believes it has a COMPLETE object store when it does not. The live
+# checkout on a host installed by scripts/install.sh is a TREELESS partial clone
+# (`--filter=tree:0`, promisor=true) — trees and blobs are fetched on demand, so
+# its store legitimately lacks objects no checkout has needed yet.
+#
+# A plain clone of that store inherits exactly those holes, with no way to fill
+# them. The merge then dies as:
+#   error: unable to read sha1 file of <path> (...)      [~40 of them]
+#   Merge with strategy ort failed.
+# which the failure handler below MISREADS as a content conflict, sending a human
+# to resolve a conflict that does not exist (2026-09-26 sma, twice).
+#
+# Fix: when the source is a partial clone, mark the scratch clone a promisor
+# clone of origin so it can lazily fetch what it lacks. Gated on the source, so
+# a full clone (horza, work) is untouched and gains no network dependency.
+LIVE_FILTER="$(git -C "$HERMES_DIR" config --get remote.origin.partialclonefilter || true)"
+if [ "$(git -C "$HERMES_DIR" config --get remote.origin.promisor || true)" = "true" ] \
+   || [ -n "$LIVE_FILTER" ]; then
+  echo "  (live checkout is a partial clone — scratch clone inherits lazy fetching)"
+  # extensions.partialclone must be set with (or before) repositoryformatversion=1.
+  git -C "$SCRATCH_CLONE" config extensions.partialclone origin
+  git -C "$SCRATCH_CLONE" config core.repositoryformatversion 1
+  git -C "$SCRATCH_CLONE" config remote.origin.promisor true
+  git -C "$SCRATCH_CLONE" config remote.origin.partialclonefilter "${LIVE_FILTER:-tree:0}"
+fi
+
 # Upstream violates its own .gitattributes: it declares `*.yaml text eol=lf`,
 # but the committed blob for plugin-catalog/intelligent-tool-break.yaml still
 # carries CRLF. Checking it out therefore dirties the worktree on every run and
@@ -387,14 +416,26 @@ if $DRY_RUN; then
 else
   # Merge upstream in. `--no-edit` keeps the default merge message so the
   # history records exactly when and what was reconciled.
-  if ! git -C "$SCRATCH_CLONE" merge --no-edit --quiet origin/main; then
+  if ! git -C "$SCRATCH_CLONE" merge --no-edit --quiet origin/main 2>"$SCRATCH_CLONE.merge.err"; then
+    # Distinguish a REAL content conflict from a broken object store BEFORE
+    # aborting: `git diff --diff-filter=U` is empty in both cases, so the old
+    # message blamed a conflict that does not exist and sent a human hunting for
+    # one (2026-09-26 sma). An unreadable object is an infrastructure fault, and
+    # the remedy is a re-clone, not a manual resolution.
+    MERGE_ERR="$(cat "$SCRATCH_CLONE.merge.err" 2>/dev/null || true)"
+    UNREAD="$(printf '%s\n' "$MERGE_ERR" | grep -c 'unable to read sha1 file' || true)"
     # A conflicting merge is a real divergence needing a human decision. Abort
     # so the scratch clone is left clean and the fork untouched — never push a
     # half-merged tree.
     git -C "$SCRATCH_CLONE" merge --abort 2>/dev/null || true
+    rm -f "$SCRATCH_CLONE.merge.err"
+    if [ "${UNREAD:-0}" -gt 0 ]; then
+      fail "scratch clone is missing $UNREAD object(s) from a partial-clone source — the merge is UNVERIFIED, not conflicting. Re-run; if it repeats, re-clone the live checkout."
+    fi
     CONFLICTED="$(git -C "$SCRATCH_CLONE" diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ' ')"
     fail "merge conflict with upstream $(git -C "$SCRATCH_CLONE" rev-parse --short origin/main)${CONFLICTED:+ on: $CONFLICTED} — resolve manually, then re-run"
   fi
+  rm -f "$SCRATCH_CLONE.merge.err"
   echo "  merged -> $(git -C "$SCRATCH_CLONE" rev-parse --short HEAD)"
 fi
 
