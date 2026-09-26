@@ -296,10 +296,27 @@ fi
 # Recreate it each run so a partial/aborted prior run can't poison the next.
 # The clone itself is a harmless shared clone (no push, never the live tree),
 # so it runs even in dry-run — it's what lets us report the real fork state.
+#
+# The reset must be UNCONDITIONAL and VERIFIED. A bare `rm -rf` can fail partway
+# (observed 2026-09-26: "Directory not empty" on hermes_cli/__pycache__ while
+# another process had the tree open), leaving a directory with no .git. The old
+# guard only cleaned up when .git existed, so the survivor skipped the rm and
+# then every subsequent `git clone` died with "destination path already exists
+# and is not an empty directory" — one interrupted run wedged the job until a
+# human cleared it by hand.
 echo ""
 echo "Preparing scratch clone at $SCRATCH_CLONE ..."
-if [ -d "$SCRATCH_CLONE/.git" ]; then
-  rm -rf "$SCRATCH_CLONE"
+if [ -e "$SCRATCH_CLONE" ]; then
+  rm -rf "$SCRATCH_CLONE" 2>/dev/null || true
+  # Retry once: a concurrent writer can recreate paths mid-walk.
+  if [ -e "$SCRATCH_CLONE" ]; then
+    echo "  (scratch clone survived the first rm — retrying)"
+    sleep 2
+    rm -rf "$SCRATCH_CLONE" 2>/dev/null || true
+  fi
+  if [ -e "$SCRATCH_CLONE" ]; then
+    fail "cannot clear the scratch clone at $SCRATCH_CLONE — remove it manually and re-run"
+  fi
 fi
 # Clone from the live checkout for speed (shared clone — no re-download), but
 # the live checkout's origin points at its own stale refs. Point this clone's
