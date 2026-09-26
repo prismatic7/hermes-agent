@@ -67,7 +67,12 @@ def get_cached_entry(server_name: str, fingerprint: str) -> Optional[dict]:
         return None
     ttl_ms = entry.get("ttl_ms")
     written_at = entry.get("written_at")
-    expired = (isinstance(ttl_ms, (int, float)) and isinstance(written_at, (int, float))
+    # A non-positive TTL means "no expiry", not "expire immediately". The SDK declares
+    # ``ListToolsResult.ttl_ms`` with ``default=0``, so a server that sends no SEP-2549 hint is
+    # indistinguishable here from one that explicitly sends 0 — and ``age_ms >= 0`` is true at any
+    # age, which expired every entry on write and made the lazy schema-cache path a permanent miss.
+    expired = (isinstance(ttl_ms, (int, float)) and ttl_ms > 0
+               and isinstance(written_at, (int, float))
                and (time.time() - written_at) * 1000.0 >= float(ttl_ms))
     return None if expired else entry
 

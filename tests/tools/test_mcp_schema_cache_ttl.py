@@ -49,3 +49,19 @@ def test_cache_scope_round_trips():
         "srv", "fp", tools=[{"name": "t"}], ttl_ms=60_000, cache_scope="private"
     )
     assert sc.get_cached_entry("srv", "fp")["cache_scope"] == "private"
+
+
+def test_zero_ttl_never_expires(monkeypatch):
+    """``ttl_ms=0`` is 'no expiry', not 'expire immediately'.
+
+    The SDK declares ``ListToolsResult.ttl_ms`` with ``default=0``, so every connected server
+    writes ``ttl_ms=0`` when it sends no SEP-2549 hint. Treating that as a TTL expired every
+    entry on write (``age_ms >= 0`` is always true), so ``get_cached_entry`` never hit and the
+    ``lazy: true`` startup path silently degraded to an eager connect on every boot.
+    """
+    sc.write_cache_entry("srv", "fp", tools=[{"name": "t"}], ttl_ms=0)
+    real_time = time.time
+    monkeypatch.setattr(sc.time, "time", lambda: real_time() + 86_400.0)
+    entry = sc.get_cached_entry("srv", "fp")
+    assert entry is not None
+    assert entry["ttl_ms"] == 0
