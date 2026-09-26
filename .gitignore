@@ -87,6 +87,13 @@ environments/benchmarks/evals/
 
 # Web UI build output
 hermes_cli/web_dist/
+# Frontend build staging roots (scripts/build/frontend-common.mjs withProduct and
+# scripts/build/tui.mjs stage inside the checkout so publication stays on one FS).
+# mkdtemp-created with a random suffix and removed in a `finally`, so an
+# interrupted build leaks one here as untracked — which dirties the checkout and
+# blocks fork-sync's fast-forward until a human clears it.
+hermes_cli/.web_dist-build-*/
+ui-tui/.dist-*/
 # Cross-process web UI build lock (flock target, always empty)
 .web_ui_build.lock
 apps/desktop/build/
