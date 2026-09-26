@@ -107,6 +107,28 @@ def _read_marker_attempts(marker_path: Path) -> int:
         return 0
 
 
+def _pid_is_zombie(pid: int) -> bool:
+    """True for a POSIX zombie (state ``Z``): the pid resolves but nothing runs.
+
+    ``os.kill(pid, 0)`` cannot tell a zombie from a live process, so an update
+    marker naming an un-reaped child (its parent never called ``wait``) reads as
+    a live holder forever and blocks every dependency sync. Stdlib-only and best
+    effort in the other direction: anything unreadable reports "not a zombie",
+    so a probe failure never turns a live owner into a dead one.
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+        return stat.rsplit(")", 1)[-1].split()[0] == "Z"
+    except (OSError, IndexError):
+        pass
+    try:
+        result = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
+                                capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.stdout.strip().startswith("Z")
+
+
 def _pid_is_running(pid: int) -> bool:
     """Best-effort stdlib-only process liveness probe.
 
@@ -145,7 +167,9 @@ def _pid_is_running(pid: int) -> bool:
         return True
     except OSError:
         return False
-    return True
+    # A zombie still resolves: kill(0) succeeds, but it runs nothing and never
+    # clears a marker naming it. POSIX only — Windows returned above.
+    return not _pid_is_zombie(pid)
 
 
 def _marker_owner_is_live(marker: Path) -> bool:

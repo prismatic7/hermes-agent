@@ -40,7 +40,10 @@ def _python(environment: Path) -> Path:
 def _inputs(project: Path, python: Path) -> str:
     digest = hashlib.sha256()
     for name in ("pyproject.toml", "uv.lock"):
-        digest.update((project / name).read_bytes())
+        entry = project / name
+        # The runtime keeps the PM tree without its lock (no [project] metadata to
+        # resolve from), so a missing input digests as absent rather than raising.
+        digest.update(entry.read_bytes() if entry.is_file() else b"")
         digest.update(b"\0")
     # A different interpreter must not reuse a venv pointing at the old one.
     digest.update(str(python.absolute()).encode())
