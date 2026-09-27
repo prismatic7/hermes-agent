@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from agent import empty_response_guard as _empty_guard
+# ``codex_responses_adapter`` imports no loop module, so this is cycle-free (see turn_final_response).
+from agent.codex_responses_adapter import reasoning_carries_leaked_call
 from agent.message_metadata import append_message
 from agent.turn_context_compaction import _refund_api_call
 from agent.turn_failure_copy import site_copy
@@ -134,6 +136,20 @@ def _terminal_empty(agent: Any, assistant_message: Any, finish_reason: str, mess
     agent._emit_diagnostic_status(
         "⚠️ Model produced reasoning but no visible response after all retries. Returning empty."
     )
+    if reasoning_carries_leaked_call(reasoning_text):
+        # The "last thoughts" below would BE an unsent tool call — call markup delivered verbatim on
+        # the user's channel (2026-09-27 custodian:cron-health blob). Say what happened without
+        # echoing the garbage; the diagnosis the user needs is that no answer came back.
+        logger.warning(
+            "Reasoning-only response carries leaked tool-call markup (%d chars) and is withheld "
+            "from delivery (model=%s provider=%s).",
+            len(reasoning_text), agent.model, agent.provider,
+        )
+        return (
+            f"⚠️ {agent.model} spent all of its output budget thinking, tried to write an action it "
+            "never sent, and produced no answer. Send /retry; if it keeps happening, switch to a "
+            "different model with /model."
+        )
     return site_copy("reasoning_only", model=agent.model, preview=reasoning_preview)
 
 

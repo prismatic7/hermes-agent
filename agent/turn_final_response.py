@@ -18,6 +18,11 @@ from agent.turn_empty_response import recover_empty_response
 from agent.turn_stop_gates import apply_stop_gates
 from agent.turn_truncation import partial_result, repetition_copy
 
+# ``codex_responses_adapter`` imports no loop module (prompt_builder / message_sanitization /
+# route_identity only), so this is cycle-free; a module-level import keeps the leaked-call screen a
+# hard dependency rather than a try/except that could silently stop screening.
+from agent.codex_responses_adapter import reasoning_carries_leaked_call
+
 _REPETITION_STOPPED = repetition_copy(
     "before delivery",
     "so the repeated output was discarded.",
@@ -103,6 +108,18 @@ def finish_text_response(
         and (_content is None or (isinstance(_content, str) and not _content.strip()))
     ):
         _promoted = agent._extract_reasoning(assistant_message) or None
+        if _promoted and reasoning_carries_leaked_call(_promoted):
+            # Chain-of-thought that is really an UNSENT tool call: promoting it would deliver the
+            # call markup verbatim as the answer (2026-09-27 custodian:cron-health blob). Refuse
+            # the promotion and fall through to the empty-response ladder, which re-elicits a real
+            # call; the re-billed input the promotion exists to avoid is worth paying not to
+            # deliver garbage to the user's channel.
+            logger.warning(
+                "Reasoning-only clean stop carries leaked tool-call markup (%d chars) — withholding "
+                "the promotion and falling through to empty-response recovery (model=%s provider=%s)",
+                len(_promoted), agent.model, agent.provider,
+            )
+            _promoted = None
         if _promoted:
             # WARNING, not INFO: a model that keeps ending turns this way is stalled
             # (planning monologue, zero tool calls) while the turn reports "complete".

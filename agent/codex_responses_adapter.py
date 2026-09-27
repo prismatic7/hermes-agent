@@ -83,6 +83,39 @@ def _leaked_tool_call_text(text: str) -> bool:
     lead_in = text[:match.start()].strip().splitlines()
     return bool(lead_in) and bool(_SHELL_JSON_LEAK_LEADIN_PATTERN.search(lead_in[-1].strip()))
 
+
+# Hermes-native wire dialect: the ``<function=tool_call>`` / ``<parameter=calls>`` shape some open
+# models emit. Sibling of ``_TOOL_CALL_LEAK_PATTERN`` rather than an extra branch of it, because the
+# two answer different questions — see ``reasoning_carries_leaked_call``. Line-start anchored (like
+# ``_UNTERMINATED_TOOL_CALL_PATTERN``) so a mid-sentence prose mention survives.
+_NATIVE_TOOL_CALL_LEAK_PATTERN = re.compile(
+    r"(?:^|\n)[ \t]*<function\s*=\s*[A-Za-z_][\w.:-]*\s*>"
+    r"|(?:^|\n)[ \t]*<parameter\s*=\s*[A-Za-z_][\w.:-]*\s*>",
+    re.IGNORECASE,
+)
+
+# Unambiguous call markup in EITHER dialect. The context-sensitive Codex-CLI ``{"cmd": ...}``
+# heuristic is deliberately outside this one: it needs a preceding action lead-in, so reasoning
+# that merely *discusses* a command would trip it.
+_LEAKED_CALL_MARKUP_PATTERN = re.compile(
+    rf"(?:{_TOOL_CALL_LEAK_PATTERN.pattern})|(?:{_NATIVE_TOOL_CALL_LEAK_PATTERN.pattern})",
+    re.IGNORECASE,
+)
+
+
+def reasoning_carries_leaked_call(text: str) -> bool:
+    """True when chain-of-thought about to be delivered AS the answer carries tool-call markup.
+
+    Deliberately separate from ``_leaked_tool_call_text``, which classifies *visible content* for
+    the Responses adapters. There the native shape is ALSO the prompt's own format spec, so a model
+    quoting its instructions must stay a legitimate answer — widening that classifier would turn a
+    quoted example into a phantom "incomplete" turn. Reasoning has no legitimate reason to contain
+    call markup of either dialect, which is what makes the stricter screen safe at the delivery
+    sites and only there (``turn_final_response`` promotion, ``turn_empty_response._terminal_empty``).
+    """
+    return bool(text) and bool(_LEAKED_CALL_MARKUP_PATTERN.search(text))
+
+
 # The Codex backend rejects literal Harmony wire tokens (``invalid_prompt: Request
 # blocked.``). Fullwidth bars survive format-character stripping and stay legible.
 _HARMONY_CONTROL_TOKEN_RE = re.compile(r"<\|(start|end|channel|message|constrain|return|call)\|>")
