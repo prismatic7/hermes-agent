@@ -639,6 +639,8 @@ class _StubEvent:
 
 class _StubNotif:
     head = "H123"
+    title = "implement the thing"
+    task_id = "t_stub"
 
 
 def _fmt_block_loop(payload):
@@ -796,3 +798,49 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     assert adapter.handled == [], (
         "notify-only subscriptions must not be woken by a review handoff"
     )
+
+
+# ---------------------------------------------------------------------------
+# Truncation must be visible (`…`) and word-aware. The live notice Chris saw
+# stopped mid-sentence at "and" with no marker, so the cut read as the end of
+# the message rather than "there is more".
+# ---------------------------------------------------------------------------
+
+
+def test_review_handoff_truncation_is_marked_and_word_aware():
+    """A >200-char review summary is cut on a word boundary with an ellipsis."""
+    from gateway.kanban_watchers_notifier import _EVENT_FORMATTERS
+
+    # A real delivered summary: the cut used to land one char past "and".
+    summary = (
+        "Audited all 46 enabled jobs against the gateway's own delivery record. "
+        "Acceptance criteria 1 and 2 are delivered: 20 jobs reach Chris, 7 of them "
+        "emit markdown tables (with the exact evidence line and last-emission date)."
+    )
+    assert len(summary) > 200
+
+    msg, wake, _ = _EVENT_FORMATTERS["review_requested"](
+        _StubEvent({"summary": summary}), _StubNotif()
+    )
+    handoff = msg.split("\n", 1)[1]
+    assert handoff.endswith("…"), "an unseen cut reads as the end of the sentence"
+
+    body = handoff[:-1]
+    last = body.split()[-1]
+    assert f" {last} " in f" {summary} ", (
+        f"cut must land on a word boundary, got a fragment {last!r}"
+    )
+    assert wake == handoff, "the wake turn must carry the same capped text"
+
+    # And the tail really is a prefix of the source, not a rewrite.
+    assert summary.startswith(body)
+
+
+def test_clip_words_does_not_eat_a_short_or_space_less_string():
+    """No ellipsis under the limit; a long unbreakable token still gets one."""
+    from gateway.kanban_watchers_notifier import _clip_words
+
+    assert _clip_words("short", 200) == "short"
+    assert _clip_words("x" * 300, 200) == "x" * 199 + "…"
+    # Whitespace-only tail must not leave a dangling space before the ellipsis.
+    assert _clip_words("word " + "y" * 300, 10) == "word…"

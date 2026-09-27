@@ -66,15 +66,26 @@ MAX_SEND_FAILURES = 12
 _LOCAL_PATH_RE = re.compile(r"(?<![\w:/])(?:/(?:Users|home|private|tmp|var|etc|workspace)/[^\s,;]+|" r"[A-Za-z]:\\[^\s,;]+)")
 
 
+def _clip_words(text: str, limit: int) -> str:
+    """Cap ``text`` at ``limit`` chars, cutting on a word boundary and marking the cut with ``…``.
+
+    An unseen cut reads as the end of the sentence (the review notice that stopped at "and"), and a
+    ``rstrip()`` after the cap does NOT give a word boundary — it strips whitespace only, so a cut
+    landing mid-token keeps the fragment. Split on the last space *before* the cap instead.
+    """
+    if len(text) <= limit:
+        return text
+    cut = text[: limit - 1]
+    return (cut.rsplit(" ", 1)[0] if " " in cut else cut).rstrip() + "…"
+
+
 def _safe_review_reason(value: Any, limit: int = 160) -> str:
     """Return a mobile-friendly review reason safe for external delivery."""
     from agent.redact import redact_sensitive_text
 
     reason = redact_sensitive_text("" if value is None else str(value), force=True, redact_url_credentials=True)
     reason = " ".join(_LOCAL_PATH_RE.sub("[local path]", reason).split())
-    if len(reason) > limit:
-        reason = reason[: limit - 1].rstrip() + "…"
-    return reason
+    return _clip_words(reason, limit)
 
 
 def _wake_scope_id(adapter: Any, sub: dict) -> Optional[str]:
@@ -364,15 +375,16 @@ def _payload(ev: Any, key: str) -> Any:
 def _clip(ev: Any, key: str, fmt: str, limit: int) -> str:
     """``fmt`` applied to the truncated payload value, or ``""`` when absent."""
     value = _payload(ev, key)
-    return fmt.format(str(value)[:limit]) if value else ""
+    return fmt.format(_clip_words(str(value), limit)) if value else ""
 
 
 _NL = "\n{}"
 
 
 def _first_line(text: str, limit: int) -> str:
+    """First line of ``text``, capped word-aware at ``limit``."""
     lines = text.strip().splitlines()
-    return lines[0][:limit] if lines else text[:limit]
+    return _clip_words(lines[0], limit) if lines else _clip_words(text, limit)
 
 
 def _fmt_completed(ev, n) -> tuple:
@@ -395,7 +407,7 @@ def _fmt_review_requested(ev, n) -> tuple:
     summary = _payload(ev, "summary")
     if summary:
         summary = str(summary)
-        handoff = f"\n{summary[:200]}"
+        handoff = f"\n{_clip_words(summary, 200)}"
         wake_handoff = _first_line(summary, 200)
     return f"👀 {n.head} ready for review — {n.title}{handoff}", wake_handoff, None
 
@@ -493,7 +505,7 @@ class _KanbanNotification:
         self.platform_str = (sub["platform"] or "").lower()
         self.task_id = sub["task_id"]
         self.sub_profile = sub.get("notifier_profile") or ""
-        self.title = (task.title if task else sub["task_id"])[:120]
+        self.title = _clip_words(task.title if task else sub["task_id"], 120)
         self.board_tag = f"[{self.board_slug}] " if self.board_slug else ""
         # Attribute the ping to the worker that did the work.
         tag = f"@{task.assignee} " if task and task.assignee else ""
