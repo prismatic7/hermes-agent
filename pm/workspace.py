@@ -20,24 +20,11 @@ from pm import paths
 from pm.package import InstallError
 from pm.plugin_declarations import read_python_declaration, manifest_version_error
 
-_MEMBER_EXCLUDE = frozenset({".git", ".venv", "venv", "node_modules", "__pycache__",
-                             # Runtime state, not build inputs. A plugin that writes a
-                             # database or a rolling backup into its own tree (curator-evolver
-                             # rewrites data/evidence.sqlite every few seconds) otherwise moves
-                             # members_stamp on every call, so expected_stamp() can never equal
-                             # the recorded stamp and every launch re-runs the dependency sync.
-                             "data", "backups", ".cache", ".pytest_cache", ".mypy_cache",
-                             ".ruff_cache"})
-
-#: Suffixes of files a plugin rewrites at RUN time. Hashing them into the build stamp is the
-#: same defect as the excluded directories above, for plugins that keep state as loose files.
-_MEMBER_RUNTIME_SUFFIXES = (".sqlite", ".sqlite3", ".db", ".db-wal", ".db-shm", ".log", ".pid")
+_MEMBER_EXCLUDE = frozenset({".git", ".venv", "venv", "node_modules", "__pycache__"})
 
 
 def _member_ignored(directory, names):
-    return [name for name in names
-            if name in _MEMBER_EXCLUDE or name.endswith(".egg-info")
-            or any(name.endswith(suffix) for suffix in _MEMBER_RUNTIME_SUFFIXES)]
+    return [name for name in names if name in _MEMBER_EXCLUDE or name.endswith(".egg-info")]
 
 
 # The uv failure classifier lives beside the uv runner (stdlib-only imports): the bootstrap
@@ -95,16 +82,20 @@ def _copy_core_inputs(source: Path, destination: Path) -> None:
         files.update(str(p.relative_to(source)) for p in source.glob(pattern))
     files.update(p.name for p in source.glob("*.py"))
 
-    # `uv.lock` is excluded only at the snapshot ROOT: the caller writes the seed
-    # lock there itself. A subdirectory lock (pm/uv.lock) is a genuine build input
-    # of that member project — pm/runtime.py:_inputs() reads it — and dropping it
-    # makes every prepared PM runtime raise FileNotFoundError. Never exclude it
-    # below the root.
+    # uv.lock is not excluded: the root lock is never copied (only ``files`` are; lock_and_sync
+    # seeds or resolves it), and pm/uv.lock is the PM runtime's input (pm/runtime.py::_inputs).
     excluded = {".git", ".venv", "venv", "node_modules", "__pycache__", "build", "dist", "release"}
+    # A root dist/ is build output, but below a package root it is shipped: the managed
+    # environment runs from this snapshot and serves bundled plugins' dashboard/dist/.
+    nested_excluded = excluded - {"dist"}
+    # `uv.lock` is excluded only at the snapshot ROOT: the caller writes the seed lock there
+    # itself. A subdirectory lock (pm/uv.lock) is a genuine build input of that member project
+    # — pm/runtime.py:_inputs() reads it — and dropping it makes every prepared PM runtime
+    # raise FileNotFoundError. Never exclude it below the root.
     root_resolved = source.resolve()
 
     def ignore(directory, names):
-        drop = excluded | ({"uv.lock"} if Path(directory).resolve() == root_resolved else set())
+        drop = nested_excluded | ({"uv.lock"} if Path(directory).resolve() == root_resolved else set())
         return [name for name in names if name in drop or name.startswith(".")
                 or name.endswith(".egg-info") or (Path(directory) / name).is_symlink()]
 
