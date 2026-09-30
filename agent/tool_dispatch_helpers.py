@@ -467,8 +467,20 @@ def make_tool_result_message(
 
 
 # Tools whose results carry attacker-controllable content; outputs under 32 chars skip wrapping.
-_UNTRUSTED_TOOL_NAMES = frozenset({"web_extract", "web_search"})
-_UNTRUSTED_TOOL_PREFIXES = ("browser_", "mcp_")
+_UNTRUSTED_TOOL_NAMES = frozenset({"web_extract", "web_search", "x_search"})
+# ``web_`` is a NAME CONVENTION, not plugin awareness: every tool that fetches the web is
+# named web_* (the two built-ins), and so is the web-search-plus plugin's web_search_plus /
+# web_extract_plus, which matched neither this set nor the old prefix tuple and therefore
+# reached the model with no untrusted framing and no risk stamp at all.
+#
+# Why a prefix and not a manifest signal (``provides_web_providers``): the manifest is read
+# by the plugin loader, while this classifier runs per tool result with only a name in hand.
+# Consulting the plugin manager here would put a registry lookup on every tool result, and a
+# manifest says what a plugin ADVERTISES, not what a given tool returns. The name is the one
+# thing the plugin author controls at registration, and a web fetcher is web_-named by the
+# convention the built-ins set. Membership only ever ADDS framing (advisory risk metadata
+# that never blocks or redacts), so a false positive costs a wrapper, not correctness.
+_UNTRUSTED_TOOL_PREFIXES = ("browser_", "mcp_", "web_")
 _UNTRUSTED_WRAP_MIN_CHARS = 32
 
 # Case-insensitive so a differently-cased tag can't forge or prematurely close the boundary.
