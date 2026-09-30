@@ -149,3 +149,60 @@ def test_unverified_fingerprint_capture_never_authorizes_a_signal(board, monkeyp
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
     assert kb.release_stale_claims(conn, signal_fn=sig) == 1
     assert killed == [] and kb.get_task(conn, tid2).status == "ready"
+
+
+def test_same_host_start_time_drift_is_not_a_recycled_pid(board, monkeypatch):
+    """A live worker whose start-time reading skews is still OUR worker (#117505).
+
+    Same-host start-time readings drift by ~1 s between the spawn-time capture and a later liveness
+    read (macOS ``kern.boottime`` / ``kinfo_proc`` adjustment). ``_pid_recycled`` compared that
+    component for exact equality, so every live worker read as recycled: the dispatcher closed its run
+    as ``crashed ... not alive`` and spawned a duplicate worker on a card that was still being worked.
+    Measured live on sma: the stored fingerprint sat exactly 100 centiseconds above every later read,
+    for every running worker. The drift-tolerant comparator (``START_TIME_DRIFT_TOLERANCE`` = 200) must
+    see the same incarnation; the epoch component must still be exact, and a genuinely recycled PID
+    (far-away start time) must still be foreign so nothing is signalled at a stranger.
+    """
+    import gateway.status as status
+    from gateway import drain_control
+
+    conn = board
+    killed = []
+    pid = os.getpid()
+    real_start = status.get_process_start_time(pid)
+    assert real_start is not None
+    epoch = drain_control.current_instantiation_epoch()
+
+    def _shifted(micros):
+        """Simulate the +1 s capture/read skew on top of the live reading."""
+        monkeypatch.setattr(status, "get_process_start_time", lambda _pid: real_start + micros)
+
+    # 100 centiseconds high, exactly as measured on sma. Still our worker.
+    _shifted(100)
+    drifted = "{}|{}".format(epoch, real_start + 100)
+    assert kbd._pid_recycled(pid, drifted) is False
+    assert kbd._worker_alive(pid, drifted) is True
+
+    # And the reverse direction (the read landing above the capture).
+    monkeypatch.setattr(status, "get_process_start_time", lambda _pid: real_start - 100)
+    assert kbd._pid_recycled(pid, "{}|{}".format(epoch, real_start)) is False
+
+    # Past the tolerance -> a genuinely different process: never signalled, claim released. Mocked
+    # far enough away that BOTH the exact-capture row and the drifted row read as strangers.
+    _shifted(status.START_TIME_DRIFT_TOLERANCE + 101)
+    assert kbd._pid_recycled(pid, "{}|{}".format(epoch, real_start)) is True
+    assert kbd._pid_recycled(pid, drifted) is True
+
+    # Inside the tolerance the drifted row is OUR worker, so the timeout path signals it (exactly as
+    # the exact-match sibling test does) instead of discarding it as a stranger and spawning a
+    # duplicate. Before the fix this row was "not alive" and the duplicate was the only outcome.
+    _shifted(100)
+    tid = _claimed_running(conn, pid=pid, started_at=drifted, max_runtime=1)
+    kbd.enforce_max_runtime(conn, signal_fn=lambda p, s: killed.append((p, s)))
+    assert killed and killed[0] == (pid, signal.SIGTERM)
+
+    # The epoch component stays exact: a row from another instantiation is foreign even when the
+    # start-time reading is identical.
+    assert kbd._pid_recycled(pid, "deadbeef-boot:1|" + str(real_start)) is True
+    # A malformed pipe form is foreign too, never a signal target.
+    assert kbd._pid_recycled(pid, "|") is True

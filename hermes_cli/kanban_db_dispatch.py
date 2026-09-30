@@ -397,19 +397,39 @@ def _pid_recycled(pid: Optional[int], started_at) -> bool:
     """True when a live ``pid`` is NOT the process fingerprinted at spawn (or the fingerprint can no
     longer be read). Signalling it would hit a stranger. ``None`` fingerprint = legacy row, never
     recycled; the UNVERIFIED marker is always foreign. An integer fingerprint (rows written before the
-    boot witness was added) compares the start time only."""
+    boot witness was added) compares the start time only.
+
+    The start-time component is compared with ``gateway.status.start_time_fingerprints_match`` rather
+    than for exact equality: a same-host start-time reading skews by about 1 s between the spawn-time
+    capture and a later liveness read (macOS ``kern.boottime`` / ``kinfo_proc`` adjustment, #117505),
+    so exact equality reported EVERY live worker as recycled. The dispatcher then closed the run as
+    ``crashed ... not alive`` and re-queued the card, spawning a duplicate worker beside one that was
+    still working it. Measured on this host: the stored fingerprint sat exactly 100 centiseconds above
+    every later read. The epoch component is still compared exactly, since a different instantiation
+    is always a different process.
+    """
     if started_at is None or not pid:
         return False
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         return True
-    if isinstance(started_at, str) and "|" in started_at:
-        return _process_fingerprint(int(pid)) != started_at
-    from gateway.status import _start_times_agree, get_process_start_time
+    from gateway.status import get_process_start_time, start_time_fingerprints_match
     current = get_process_start_time(int(pid))
     if current is None:
         return True
+    if isinstance(started_at, str) and "|" in started_at:
+        recorded_epoch, _, recorded_start = started_at.partition("|")
+        if not recorded_start:
+            return True
+        # The epoch is identity, not a reading: any difference is a different instantiation.
+        from gateway.drain_control import current_instantiation_epoch
+        if recorded_epoch != current_instantiation_epoch():
+            return True
+        try:
+            return not start_time_fingerprints_match(recorded_start, current)
+        except (TypeError, ValueError):
+            return True
     try:
-        return not _start_times_agree(current, started_at)
+        return not start_time_fingerprints_match(started_at, current)
     except (TypeError, ValueError):
         return True
 
