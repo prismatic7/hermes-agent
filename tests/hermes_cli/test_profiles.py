@@ -160,6 +160,62 @@ class TestCreateProfile:
         assert cfg["model"]["default"] == "some/model"
 
 
+
+    def test_fresh_profile_inherits_the_root_journal_mode(self, profile_env):
+        """A fresh profile must not silently undo the root database.journal_mode.
+
+        Journal mode resolves from the profile OWN config.yaml and falls back to the
+        built-in default wal; it never consults the root home. Seeding only the model
+        block therefore BORN-WALs every store the profile creates (cron/executions.db,
+        cron/notepad.db, projects.db) and discards a root-level delete — the setting
+        that keeps those stores sidecar-free on weak-fsync filesystems.
+        """
+        default_home = profile_env / ".hermes"
+        (default_home / "config.yaml").write_text(
+            "model:\n  provider: nous\n  default: some/model\n"
+            "database:\n  journal_mode: delete\n", encoding="utf-8")
+
+        profile_dir = create_profile("coder", no_alias=True)
+
+        cfg = yaml.safe_load((profile_dir / "config.yaml").read_text(encoding="utf-8-sig"))
+        assert cfg["database"]["journal_mode"] == "delete"
+
+
+    def test_fresh_profile_does_not_pin_unset_database_defaults(self, profile_env):
+        """Only leaves the operator WROTE travel; None placeholders must not.
+
+        DEFAULT_CONFIG spells wal_autocheckpoint and journal_size_limit as None, so a
+        blanket copy would materialise them as explicit pins and freeze a value the
+        built-in default is supposed to keep tracking.
+        """
+        default_home = profile_env / ".hermes"
+        (default_home / "config.yaml").write_text(
+            "model:\n  provider: nous\n  default: some/model\n"
+            "database:\n  wal_autocheckpoint: 1000\n  journal_size_limit: null\n",
+            encoding="utf-8")
+
+        profile_dir = create_profile("coder", no_alias=True)
+
+        cfg = yaml.safe_load((profile_dir / "config.yaml").read_text(encoding="utf-8-sig"))
+        assert cfg["database"] == {"wal_autocheckpoint": 1000}
+
+
+    def test_cloned_profile_config_carries_the_journal_mode(self, profile_env):
+        """--clone copies the source config.yaml verbatim, so it inherits the mode too.
+
+        The behavioural claim is the one that matters: the new profile stores open in
+        the mode the operator set, not the built-in default.
+        """
+        default_home = profile_env / ".hermes"
+        (default_home / "config.yaml").write_text(
+            "model:\n  provider: nous\n  default: some/model\n"
+            "database:\n  journal_mode: delete\n", encoding="utf-8")
+
+        profile_dir = create_profile("coder", clone_config=True, no_alias=True)
+
+        cfg = yaml.safe_load((profile_dir / "config.yaml").read_text(encoding="utf-8-sig"))
+        assert cfg["database"]["journal_mode"] == "delete"
+
     def test_fresh_profile_inherits_its_custom_provider_gateway(self, profile_env):
         """The inherited model may point at a custom `providers:` gateway (self-hosted / local
         endpoint). Copying `model` alone left the new bot with `model.provider: my-gateway` and

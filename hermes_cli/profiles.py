@@ -704,7 +704,16 @@ def launch_model_seed(source_cfg: dict) -> dict:
     """The config a fresh profile needs to run the launch profile's model: its ``model`` block plus,
     when that block points at a custom ``providers:`` gateway (self-hosted / local endpoint), that
     provider's definition — ``model.provider: my-gateway`` alone is "Unknown provider" on the first
-    turn. ``{}`` when the launch profile has no model."""
+    turn. ``{}`` when the launch profile has no model.
+
+    Also carries any ``database`` block the operator actually wrote in the launch profile. Journal
+    mode resolves from the profile's OWN ``config.yaml`` (``hermes_state_wal.resolve_journal_mode``
+    reads ``get_config_path()`` of the current home) and falls back to the built-in default ``wal``;
+    it never consults the root home. A profile seeded with the model alone is therefore BORN WAL on
+    every store it creates (``cron/executions.db``, ``cron/notepad.db``, ``projects.db``), silently
+    discarding a root-level ``database.journal_mode: delete`` and the sidecar-free handling it buys.
+    Only leaves the operator actually wrote are copied; ``None`` placeholders stay behind so a
+    built-in default is never materialised as an explicit pin."""
     model_cfg = source_cfg.get("model")
     if not model_cfg:
         return {}
@@ -713,6 +722,9 @@ def launch_model_seed(source_cfg: dict) -> dict:
     name = model_cfg.get("provider") if isinstance(model_cfg, dict) else None
     if isinstance(providers, dict) and name in providers:
         seed["providers"] = {name: providers[name]}
+    database = {k: v for k, v in (source_cfg.get("database") or {}).items() if v is not None}
+    if database:
+        seed["database"] = database
     return seed
 
 
