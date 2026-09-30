@@ -1,16 +1,12 @@
 """Cron prompt threat scanning: the small user-authored prompt gets the strict pattern set;
 the assembled prompt (with skill bodies) gets only prose-proof directives."""
-
 import logging
 import re
-
 # Single source of truth shared with the install-time scanner (skills_guard): a narrower
 # cron-local copy once let obfuscated directives slip past this runtime tripwire.
 from tools.threat_patterns import INVISIBLE_CHARS as _CRON_INVISIBLE_CHARS
-
 # Logger parity with the origin module (these functions used to log there).
 logger = logging.getLogger("tools.cronjob_tools")
-
 # Strict patterns — user prompt only. A directive-shaped cron prompt has no business
 # containing `cat ~/.hermes/.env` or `rm -rf /`; there it is a smoking gun, not prose.
 # Two threat surfaces, two scanners: 1. `_scan_cron_prompt()` runs against this at create/update time and as
@@ -33,11 +29,31 @@ _CRON_THREAT_PATTERNS = [
     (r'authorized_keys', "ssh_backdoor"), (r'/etc/sudoers|visudo', "sudoers_mod"),
     (r'rm\s+-rf\s+/', "destructive_root_rm"),
 ]
-
 # Looser set for the assembled prompt: command-shape patterns are dropped because skill
 # markdown (postmortems, runbooks) legitimately *describes* those commands and skill bodies
 # are vetted at install time — only unambiguous injection directives remain.
-_CRON_SKILL_ASSEMBLED_PATTERNS = _CRON_THREAT_PATTERNS[:4]
+# The deception pattern in this loose set is PROSE-SAFE, not the bare strict-set regex.
+# This set exists to keep only patterns whose phrasing does NOT survive normal English
+# prose, and bare do-not-tell-the-user plainly does: a vetted skill saying "Do not tell
+# the user a paid tier is required" is ordinary UX guidance, not a concealment payload,
+# yet it blocked cron job b6093c36fa06 on every run (the phrase sits in the
+# public-company-discovery skill). A real concealment directive names WHAT is hidden
+# (about X / that Y / what-why-how-when-where-who / a second-person clause); UX guidance
+# has no object and is not a directive shape. Copying skills_guard's exemption
+# lookahead does NOT fix this case: its exempt words (unless/except/until/confirm/
+# diagnose/verify/check) and same-line scope leave that sentence matching. The STRICT
+# set keeps the bare pattern for user-authored prompts, where such a phrase IS a
+# smoking gun.
+_CRON_ASSEMBLED_DECEPTION_RE = (
+    r"do\s+not\s+(?:\w+\s+){0,8}tell\s+(?:\w+\s+){0,8}the\s+user\s+"
+    r"(?:about|that|what|why|where|when|who|how|you|anything|everything|the\s+truth)\b"
+)
+_CRON_SKILL_ASSEMBLED_PATTERNS = [
+    _CRON_THREAT_PATTERNS[0],                        # prompt_injection
+    (_CRON_ASSEMBLED_DECEPTION_RE, "deception_hide"),
+    _CRON_THREAT_PATTERNS[2],                        # sys_prompt_override
+    _CRON_THREAT_PATTERNS[3],                        # disregard_rules
+]
 
 _CRON_SECRET_VAR_RE = r'\$\{?\w*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)\w*\}?'
 # Obvious leak paths only: secret in the destination URL, in a POST/form body, or in an
