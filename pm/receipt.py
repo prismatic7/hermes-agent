@@ -288,6 +288,39 @@ def latest() -> Optional[dict[str, Any]]:
     return None
 
 
+def recent_warnings(limit: int = 5) -> list[dict[str, Any]]:
+    """Warnings from the newest receipts that carry any, newest first.
+
+    ``latest()`` is whichever receipt finished last, and a warning-free sync
+    routinely overwrites a warning-carrying one — so a reader of latest.json
+    alone reports "no warnings" while a plugin was evicted minutes earlier.
+    Eviction fires during a gateway restart with no operator present, so the
+    warning must survive the next, quiet sync to be seen at all.
+
+    Each row carries the message plus the receipt it came from, so an operator
+    can open the whole record. Bounded by ``limit`` and by the existing
+    ``_RECEIPT_KEEP`` rotation.
+    """
+    directory = _receipt_dir()
+    try:
+        files = sorted((p for p in directory.glob("pm_*.json") if p.is_file()),
+                       key=lambda p: p.name, reverse=True)
+    except OSError:
+        return []
+    rows: list[dict[str, Any]] = []
+    for path in files:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            continue
+        for warning in data.get("warnings") or []:
+            rows.append({**warning, "receipt": path.name, "kind": data.get("kind"),
+                         "finished_at": data.get("finished_at")})
+        if len(rows) >= limit:
+            break
+    return rows[:limit]
+
+
 def _receipt_name(data: dict[str, Any]) -> str:
     """Unique name for concurrent writers: stamp + pid + full random
     uuid4 (same pid+random convention as the updater's receipts)."""

@@ -745,10 +745,20 @@ def cmd_status(args) -> int:
     from pm import receipt
 
     data = receipt.latest()
-    if data is None:
+    warnings = receipt.recent_warnings()
+    if data is None and not warnings:
         print("no pm sync receipt yet (no venv operation has run)")
         return 0
-    print(_json.dumps(data, indent=2))
+    if warnings:
+        print("pm eviction/refusal warnings (newest first):")
+        for warning in warnings:
+            when = warning.get("at") or warning.get("finished_at") or ""
+            kind = warning.get("kind") or "sync"
+            message = warning.get("message") or ""
+            print("  [warn] %s %s: %s" % (when, kind, message))
+            print("         receipt: %s" % warning.get("receipt"))
+    if data is not None:
+        print(_json.dumps(data, indent=2))
     return 0
 
 

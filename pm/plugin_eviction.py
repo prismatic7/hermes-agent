@@ -74,6 +74,58 @@ def static_verdicts(entries: list[Entry], python_version: str) -> tuple[dict[Pat
     return reasons, waiting
 
 
+def _colliding_members(entries: list[Entry]) -> dict[Path, str]:
+    """Buildable members that would declare one [project].name twice in this selection.
+
+    Each home keeps its OWN copy of a plugin, so one plugin enabled in several profiles
+    puts two buildable workspace members with a single [project].name into one
+    generation, and uv lock refuses the WHOLE workspace. The eviction path reads that as
+    "the plugin does not fit", disables it, and for a security plugin silently defeats it
+    (custom-dangerous-patterns on trade-bot, 2026-09-30), re-firing on every sync.
+
+    A collision is a fact about the SELECTION, never about one plugin, so none of the
+    colliding members is evictable: they stay enabled, the reason names the homes to
+    reconcile, and they rejoin the build once one copy is gone.
+    """
+    import tomllib
+
+    from pm.plugin_declarations import read_python_declaration
+
+    by_name: dict[str, list[tuple[Path, Path]]] = {}
+    for plugins_dir, _name, plugin_dir in entries:
+        key = plugin_dir.resolve()
+        try:
+            declaration = read_python_declaration(plugin_dir)
+        except (OSError, ValueError, TypeError):
+            continue
+        if not declaration.is_member or declaration.pyproject is None:
+            continue
+        try:
+            document = tomllib.loads(declaration.pyproject.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+            continue
+        # Mirrors the virtual verdict in _workspace_member exactly: a member with no
+        # build backend is metadata-only and gets renamed to its unique key, so only a
+        # BUILDABLE member keeps its declared name and only it can collide.
+        virtual = ("build-system" not in document
+                   and document.get("tool", {}).get("uv", {}).get("package") is not True)
+        if virtual:
+            continue
+        declared = (document.get("project") or {}).get("name")
+        if declared:
+            by_name.setdefault(str(declared), []).append((key, plugins_dir.parent.resolve()))
+    collisions: dict[Path, str] = {}
+    for declared, rows in by_name.items():
+        if len({key for key, _home in rows}) < 2:
+            continue
+        for key, _home in rows:
+            others = ", ".join(sorted(str(home) for other, home in rows if other != key))
+            collisions[key] = (f"it shares the build-metadata name {declared!r} with the copy in "
+                               f"{others}, and uv refuses a workspace holding two members of one "
+                               f"name; disable the duplicate in all but one profile")
+    return collisions
+
+
 class PluginEviction:
     """Config edits disabling the plugins in *reasons*; published like a plugin selection."""
 
@@ -160,10 +212,12 @@ def sync_evicting(package, facts, fact: dict, *, extras, shipped, frozen, explic
             notices.append(f"Skipped the plugins of profile {home}: {exc}; they rejoin once its config.yaml is fixed")
     entries = enabled_plugin_entries(skip_invalid_secondary=True)
     reasons, waiting = static_verdicts(entries, _interpreter_version())
+    collisions = _colliding_members(entries)
 
     def members() -> list[Path]:
         return list(dict.fromkeys(plugin_dir for _plugins_dir, _name, plugin_dir in entries
                                   if plugin_dir.resolve() not in reasons and plugin_dir.resolve() not in waiting
+                                  and plugin_dir.resolve() not in collisions
                                   and _is_member_candidate(plugin_dir)))
 
     def commit() -> None:
@@ -199,6 +253,8 @@ def sync_evicting(package, facts, fact: dict, *, extras, shipped, frozen, explic
         key = plugin_dir.resolve()
         if key in reasons:
             notices.append(f"Disabled plugin '{name}' in {plugins_dir.parent}: {reasons[key]}")
+        elif key in collisions:
+            notices.append(f'Left plugin "{name}" in {plugins_dir.parent} enabled: {collisions[key]}')
         elif key in waiting:
             notices.append(f"Left plugin '{name}' in {plugins_dir.parent} out of this update: {waiting[key]}; "
                            "it stays enabled and rejoins once Hermes reports a version it accepts")

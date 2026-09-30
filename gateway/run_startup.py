@@ -273,6 +273,7 @@ class GatewayStartupMixin:
 
         async def _boot_sends() -> None:
             await self._send_restart_notification()
+            await self._send_pm_eviction_notice()
             if planned_restart_notification_pending:
                 await self._replay_pending_planned_restart_notification()
             await self._redeliver_claimed_obligations(claimed)

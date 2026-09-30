@@ -979,6 +979,63 @@ class GatewayNotificationsMixin:
             except Exception:
                 logger.warning("Planned-restart notification remains pending", exc_info=True)
 
+    async def _send_pm_eviction_notice(self) -> None:
+        """Push any pm plugin eviction to the home channels at boot.
+
+        Eviction disables a plugin whose dependency environment no longer builds
+        with it, and it fires during a gateway restart — when nobody is watching.
+        It writes a receipt and a stderr line, and a warning-free sync overwrites
+        latest.json within minutes, so the boot path is the reliable place to
+        surface it. On trade-bot this silently defeated a security control
+        (custom-dangerous-patterns, 2026-09-30).
+
+        Durable across restarts by construction: an evicted plugin stays in
+        plugins.disabled, so the warning is still inside the receipt window after
+        any number of restarts. A marker records the newest receipt already
+        announced, so a crash-looping gateway announces it once, not every boot.
+        Best-effort — a failure here must never block startup.
+        """
+        try:
+            from pm import receipt as pm_receipt
+
+            rows = pm_receipt.recent_warnings()
+            if not rows:
+                return
+            from gateway.run import _hermes_home
+            from utils import atomic_json_write
+
+            marker = _hermes_home / ".pm_eviction_notice.json"
+            announced = ""
+            try:
+                announced = str(json.loads(marker.read_text(encoding="utf-8-sig")).get("last_receipt") or "")
+            except (OSError, ValueError):
+                pass
+            pending = []
+            for row in rows:
+                if row.get("receipt") == announced:
+                    break
+                pending.append(row)
+            if not announced:
+                # First run on this host: announce the newest warning only, never the whole window.
+                pending = pending[:1]
+            if not pending:
+                return
+            lines = ["WARNING: the last dependency sync disabled a plugin:"]
+            for row in pending:
+                lines.append("* " + str(row.get("message") or ""))
+            lines.append("Re-enable it after fixing its dependencies; `hermes pm status` has the receipts.")
+            message = chr(10).join(lines)
+            from gateway.warning_notifications import present_notification
+
+            for platform, _platform_cfg, home, transport in self._home_channel_transports():
+                await present_notification(
+                    lambda: self._send_home_channel_message(
+                        platform, home, transport, message, "pm eviction notice failed for %s:%s: %s"),
+                    platform=platform)
+            atomic_json_write(marker, {"last_receipt": rows[0].get("receipt")}, indent=None)
+        except Exception:
+            logger.debug("pm eviction notice skipped", exc_info=True)
+
     async def _send_home_channel_startup_notifications(
         self, *, skip_targets: Optional[set[tuple[str, str, Optional[str]]]] = None
     ) -> set[tuple[str, str, Optional[str]]]:
