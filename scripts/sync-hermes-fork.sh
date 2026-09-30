@@ -116,6 +116,70 @@ echo "=== $TIMESTAMP (role=$ROLE dry_run=$DRY_RUN host=$HOST_LABEL) ==="
 
 fail() { echo "ERROR: $*"; emit "fork-sync[$HOST_LABEL/$ROLE] FAILED: $*"; exit 1; }
 
+# ── Partial-clone pack markers (#124272) ─────────────────────────────────────
+# A `--filter=tree:0` checkout legitimately lacks trees and blobs no checkout has
+# needed yet, and git only knows they may be fetched on demand when the pack
+# holding their neighbours carries a `.promisor` marker. An UNMARKED pack makes
+# git believe its store is complete, so the local repack a fetch performs treats
+# those absent objects as corruption and the fetch dies:
+#
+#   fatal: bad tree object <sha>
+#   error: <url> did not send all necessary objects
+#
+# That is upstream #124272, and it is intermittent: it only fires when the
+# negotiation/repack walks a region whose objects this checkout never fetched,
+# which changes every sync. `scripts/install.sh` heals the same state for the
+# installer and `hermes_cli/gitlock.py::mark_unmarked_packs_promisor` for
+# `hermes update`; this live-checkout fetch was the site that never got it. On
+# 2026-10-01 sma's checkout carried 6 unmarked packs and the daily sync failed
+# with exactly those two lines — and the tree it named was PRESENT locally, which
+# is what makes the unmarked pack the cause rather than a missing-object gap.
+#
+# Marking is idempotent, rewrites and deletes nothing, and is gated on the repo
+# really being a partial clone so a full checkout (horza, work) is untouched.
+# Do NOT instead pass `--filter=` to this fetch: `--filter` writes
+# `remote.<name>.promisor`/`partialclonefilter`, so it silently CONVERTS a full
+# clone into a partial one (measured, not assumed).
+mark_unmarked_packs_promisor() {  # <repo>
+  local repo="$1" pack marked=0
+  if [ "$(git -C "$repo" config --bool --get remote.origin.promisor 2>/dev/null)" != "true" ] \
+     && [ -z "$(git -C "$repo" config --get remote.origin.partialclonefilter 2>/dev/null)" ]; then
+    return 0
+  fi
+  for pack in "$repo"/.git/objects/pack/pack-*.pack; do
+    [ -f "$pack" ] || continue
+    if [ ! -e "${pack%.pack}.promisor" ]; then
+      if : > "${pack%.pack}.promisor" 2>/dev/null; then
+        marked=$((marked + 1))
+      else
+        echo "  WARNING: could not mark $pack as a partial-clone pack"
+      fi
+    fi
+  done
+  [ "$marked" -gt 0 ] && echo "  marked $marked unmarked pack(s) as partial-clone packs (#124272)"
+  return 0
+}
+
+# fetch_live <repo> <fetch args...> — heal the unmarked-pack state, then fetch;
+# on failure NAME the #124272 shape rather than reporting a bare "did not send
+# all necessary objects", which reads like a broken remote and was mis-diagnosed
+# as a fetch-negotiation bug.
+fetch_live() {  # <repo> <fetch args...>
+  local repo="$1"; shift
+  mark_unmarked_packs_promisor "$repo"
+  local err
+  if err="$(git -C "$repo" fetch "$@" 2>&1)"; then
+    [ -n "$err" ] && printf '%s\n' "$err"
+    return 0
+  fi
+  printf '%s\n' "$err"
+  case "$err" in
+    *"did not send all necessary objects"*|*"bad tree object"*)
+      fail "fetch failed — partial checkout still has unmarked packs (#124272); re-run, and if it repeats mark them by hand: for p in $repo/.git/objects/pack/pack-*.pack; do [ -e \"\${p%.pack}.promisor\" ] || : > \"\${p%.pack}.promisor\"; done" ;;
+  esac
+  return 1
+}
+
 # ── Post-sync install reconcile ──────────────────────────────────────────────
 # This script moves the live checkout; it does NOT make the venv match it. Two
 # incidents in two days came from exactly that gap (see
@@ -204,6 +268,12 @@ LIVE_BRANCH="$(git -C "$HERMES_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || e
 [ "$LIVE_BRANCH" != "HEAD" ] || fail "live checkout is on detached HEAD"
 echo "Live checkout: branch='$LIVE_BRANCH'"
 
+# Heal unmarked partial-clone packs BEFORE anything is cloned from or fetched into
+# this checkout. The scratch clone below is a LOCAL clone of this path, so it
+# hardlinks these same packs and inherits the unmarked state; marking here is
+# what keeps the merge safe too. No-op on a full checkout (see the helper).
+mark_unmarked_packs_promisor "$HERMES_DIR"
+
 # The live tree must be clean before we consider moving it. Note we do NOT
 # reset it here if it's dirty — we just won't touch it.
 LIVE_DIRTY=false
@@ -227,7 +297,7 @@ if [ "$ROLE" = "follower" ]; then
     finish "fork-sync[$HOST_LABEL/$ROLE] DRY RUN: would pull fork/customizations"
   fi
 
-  git -C "$HERMES_DIR" fetch --quiet fork customizations 2>&1 || fail "fetch fork failed"
+  fetch_live "$HERMES_DIR" --quiet fork customizations || fail "fetch fork failed"
   TARGET_SHA="$(git -C "$HERMES_DIR" rev-parse fork/customizations)"
   LIVE_SHA="$(git -C "$HERMES_DIR" rev-parse HEAD)"
   echo "  fork/customizations: $(git -C "$HERMES_DIR" rev-parse --short "$TARGET_SHA")"
@@ -548,7 +618,7 @@ elif [ "$(git -C "$HERMES_DIR" rev-parse HEAD)" = "$NEW_CUSTOM_SHA" ]; then
   echo "  live checkout already at fork/customizations ($(git -C "$HERMES_DIR" rev-parse --short HEAD))"
 else
   # Fetch the freshly-merged fork ref into the live checkout, then fast-forward.
-  git -C "$HERMES_DIR" fetch --quiet fork customizations 2>&1 || fail "live fetch failed"
+  fetch_live "$HERMES_DIR" --quiet fork customizations || fail "live fetch failed"
   if git -C "$HERMES_DIR" merge --ff-only --quiet fork/customizations >/dev/null 2>&1; then
     LIVE_CHANGED=true
     echo "  live checkout fast-forwarded -> $(git -C "$HERMES_DIR" rev-parse --short HEAD)"
