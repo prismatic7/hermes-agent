@@ -396,6 +396,30 @@ git -C "$SCRATCH_CLONE" checkout --quiet -B customizations fork/customizations
 # can otherwise leave the tree "dirty" and block the merge.
 git -C "$SCRATCH_CLONE" reset --hard --quiet HEAD
 git -C "$SCRATCH_CLONE" clean -fd --quiet
+
+# ── Carry the LIVE checkout's local-only commits before anything else runs ──
+# This is the narrowest window in the whole job: the checkout is checked for
+# cleanliness at the top of the run, but an agent session working in it can
+# commit at any moment after. Its commit then lives ONLY there, and the fork —
+# the canonical branch every host deploys from — has never seen it. Merging it
+# in NOW, on the branch about to be pushed, means the work reaches the fork
+# whether or not the live-update step can move the checkout this run.
+#
+# Fails the run on a conflict: a half-carried branch must never be pushed.
+LIVE_CARRIED=0
+PRESERVE="$SCRATCH_CLONE/scripts/fork-sync-preserve-live-commits.sh"
+if [ -f "$PRESERVE" ]; then
+  if PRESERVE_OUT="$("$PRESERVE" "$SCRATCH_CLONE" "$HERMES_DIR" 2>&1)"; then
+    printf '%s\n' "$PRESERVE_OUT"
+    case "$PRESERVE_OUT" in *"nothing to carry"*) ;; *) LIVE_CARRIED=1 ;; esac
+  else
+    printf '%s\n' "$PRESERVE_OUT"
+    fail "could not carry the live checkout's local commits — resolve by hand, then re-run"
+  fi
+else
+  echo "  (preserve-live-commits script absent — live-only commits will NOT reach the fork)"
+fi
+
 # macOS case-insensitive-filesystem workaround: upstream used to track two
 # contributors/emails/ files that differ only by case
 # (agent@Agents-Mac-mini.local / agent@agents-Mac-mini.local). They collide on
