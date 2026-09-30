@@ -613,6 +613,39 @@ def test_generation_roots_resolve_this_install():
     assert all(root.is_dir() for root in roots)
 
 
+def test_sealed_payload_runtime_is_not_a_hermes_generation(tmp_path, monkeypatch):
+    """A sealed payload's own runtime survives the strip; a PM generation still does not.
+
+    Regression from a27b833aa9a8: ``_hermes_generation_roots()`` claimed every
+    ``<install>/environments/<gen>/venv`` by provenance, which also matched a payload whose
+    runtime sits under its own state dir -- the payload's only usable interpreter was then
+    stripped out of every child env. Same paths in both halves; the bundle manifest beside
+    the payload is the only difference.
+    """
+    payload = tmp_path / "payload"
+    runtime = payload / "state/environments/candidate/venv"
+    site = runtime / ("Lib/site-packages" if os.name == "nt" else
+                      f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages")
+    site.mkdir(parents=True)
+    (runtime / "pyvenv.cfg").write_text("version = 3.14\n", encoding="utf-8")
+    generations = (payload / "state/environments").resolve()
+    monkeypatch.setattr("pm.environments.install_state_dir", lambda repo: payload / "state")
+    manifest = payload / "manifest.json"
+    manifest.write_text("{}", encoding="utf-8")
+
+    assert pp._hermes_generation_roots() == ()
+    env = {"PYTHONPATH": os.pathsep.join([str(site), "/user/lib"])}
+    pp._strip_hermes_owned_pythonpath(env)
+    assert env["PYTHONPATH"].split(os.pathsep) == [str(site), "/user/lib"]
+
+    # Without the payload marker the same tree is a PM generation again, so it is stripped.
+    manifest.unlink()
+    assert pp._hermes_generation_roots() == (generations,)
+    env = {"PYTHONPATH": os.pathsep.join([str(site), "/user/lib"])}
+    pp._strip_hermes_owned_pythonpath(env)
+    assert env["PYTHONPATH"].split(os.pathsep) == ["/user/lib"]
+
+
 @pytest.mark.platforms("linux", "macos", "windows")
 @pytest.mark.parametrize("link_at", ["home", "repo", "unrelated"])
 @pytest.mark.parametrize("profile", [False, True])
