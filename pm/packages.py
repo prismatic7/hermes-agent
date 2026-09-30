@@ -346,7 +346,32 @@ def uv_cache_dir() -> Path:
     return machine_cache
 
 
+
+
+def _record_mint(generation, extras, members, repair, explicit) -> None:
+    """Log a PM generation mint BEFORE it can fail, naming the caller.
+
+    Generations are minted by the boot path, the receipted pm.sync, and the
+    eviction trial builds. Only two of those write a receipt, so a burst was
+    previously unattributable; the caller frame is what distinguishes them.
+    """
+    import os
+
+    frames = []
+    frame = sys._getframe(1)
+    while frame is not None and len(frames) < 8:
+        path = frame.f_code.co_filename
+        if "/pm/" in path or "/hermes_cli/" in path:
+            frames.append(f"{Path(path).name}:{frame.f_lineno}:{frame.f_code.co_name}")
+        frame = frame.f_back
+    LOG.warning("PM minted generation %s (members=%d, extras=%d, repair=%s, explicit=%s) via pid=%d %s",
+                generation.name, len(members or ()), len(extras or ()), repair, explicit,
+                os.getpid(), " <- ".join(frames))
+
 @register
+
+
+
 class Venv(StatePackage):
     """The project venv: pyproject.toml + uv.lock + enabled extras.
     Made true by `uv sync --frozen`; uv is its internal dependency."""
@@ -418,6 +443,7 @@ class Venv(StatePackage):
         try:
             generation.mkdir(parents=True)
             (generation / ".lease-managed").touch()
+            _record_mint(generation, extras, members, repair, explicit)
             environment.create()
             prior = Facts(runtime_facts_path(project), strict=repair).get("venv") or {}
             replay = None
