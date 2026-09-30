@@ -256,13 +256,14 @@ if [ "$ROLE" = "follower" ]; then
   # The leader normally MERGES upstream into customizations, so fork history is
   # appended to and the live checkout moves forward by fast-forward.
   #
-  # BUT a fork branch that was ever rebuilt (cherry-picked/rebased upstream of
-  # this run) has a tip the live checkout does not descend from, so --ff-only
-  # legitimately fails. The fork is the authority and this checkout is a
-  # deployment mirror, so fall back to `reset --hard` — but ONLY here, i.e.
-  # after confirming the tree is clean and on the right branch, and never
-  # silently: the discarded count is reported.
-  DISCARDED="$(git -C "$HERMES_DIR" rev-list --count fork/customizations..HEAD 2>/dev/null || echo '?')"
+  # A `reset --hard` fallback used to sit here and was REMOVED (2026-09-30): it
+  # discarded local commits, and it reported the discarded count only AFTER
+  # discarding them. That is how a live checkout's committed work disappears —
+  # on sma, `56dc2b79bb`'s members_stamp fix was lost to a reset and the whole
+  # fleet silently served without it. This checkout may be a deployment mirror,
+  # but a commit in it is still work: refuse, print exactly what is at stake, and
+  # let a human push it to the fork (the canonical branch) first.
+  LIVE_AHEAD="$(git -C "$HERMES_DIR" rev-list --count fork/customizations..HEAD 2>/dev/null || echo '?')"
   if git -C "$HERMES_DIR" merge --ff-only --quiet fork/customizations >/dev/null 2>&1; then
     LIVE_CHANGED=true
     echo "  live checkout fast-forwarded -> $(git -C "$HERMES_DIR" rev-parse --short HEAD)"
@@ -271,20 +272,15 @@ if [ "$ROLE" = "follower" ]; then
     echo "=== Sync complete (follower) ==="
     echo "=== done ==="
     finish "fork-sync[$HOST_LABEL/$ROLE] ok: customizations $(git -C "$HERMES_DIR" rev-parse --short "$LIVE_SHA") -> $(git -C "$HERMES_DIR" rev-parse --short HEAD)"
-  elif git -C "$HERMES_DIR" reset --hard --quiet fork/customizations >/dev/null 2>&1; then
-    LIVE_CHANGED=true
-    echo "  live checkout reset -> $(git -C "$HERMES_DIR" rev-parse --short HEAD)"
-    echo "  (fork branch had been rebuilt, so no fast-forward existed; $DISCARDED"
-    echo "   local commit(s) were left behind — the fork is the authority.)"
-    echo "  NOTE: restart Hermes for the updated code to load."
-    echo ""
-    echo "=== Sync complete (follower) ==="
-    echo "=== done ==="
-    finish "fork-sync[$HOST_LABEL/$ROLE] ok (reset): customizations $(git -C "$HERMES_DIR" rev-parse --short "$LIVE_SHA") -> $(git -C "$HERMES_DIR" rev-parse --short HEAD)"
   else
-    echo "  SKIP: cannot advance (fast-forward and reset both failed)."
-    echo "  Manual: cd $HERMES_DIR && git fetch fork customizations && git merge --ff-only fork/customizations"
-    fail "could not update live checkout to fork/customizations"
+    # Never reset. Report and leave the tree exactly as it is.
+    echo "  SKIP: live checkout does not descend from fork/customizations."
+    echo "        local commits ahead of the fork: $LIVE_AHEAD"
+    git -C "$HERMES_DIR" log --oneline fork/customizations..HEAD 2>/dev/null | sed 's/^/          /'
+    echo "  Manual: cd $HERMES_DIR && git push fork HEAD:customizations"
+    echo "          (then let the next sync fast-forward, or: git reset --hard fork/customizations)"
+    echo "=== done (skipped: would have discarded $LIVE_AHEAD local commit(s)) ==="
+    finish "fork-sync[$HOST_LABEL/$ROLE] SKIPPED: live checkout has $LIVE_AHEAD local commit(s) not on the fork — push them, not reset"
   fi
 fi
 
@@ -454,6 +450,26 @@ else
   fi
   rm -f "$SCRATCH_CLONE.merge.err"
   echo "  merged -> $(git -C "$SCRATCH_CLONE" rev-parse --short HEAD)"
+  # A merge resolves each conflict once, but a clean-looking result can still
+  # DISCARD our side of a file. That is how `56dc2b79bb`'s members_stamp guard
+  # vanished on 2026-09-30 while its test kept passing: the fork and upstream
+  # both lacked the fix, so nothing failed and the bug came back. Report, never
+  # fail — upstream implementing the same behaviour its own way is the CORRECT
+  # resolution, and only a human can tell that from a real loss.
+  LOSS_CHECK="$SCRATCH_CLONE/scripts/fork-sync-custom-loss-check.py"
+  if [ -f "$LOSS_CHECK" ]; then
+    # Resolve an interpreter by absolute path: cron's PATH carries neither
+    # Homebrew nor ~/.local/bin.
+    LOSS_PY="$(command -v python3 || true)"
+    [ -n "$LOSS_PY" ] || LOSS_PY="/usr/bin/python3"
+    if git -C "$SCRATCH_CLONE" show HEAD:scripts/fork-sync-custom-loss-check.py > "$SCRATCH_CLONE/.loss-check.py" 2>/dev/null; then
+      ( cd "$SCRATCH_CLONE" && "$LOSS_PY" .loss-check.py 2>&1 | sed 's/^/  /' ) \
+        || echo "  (custom-loss check could not run)"
+    else
+      echo "  (custom-loss check unavailable)"
+    fi
+    rm -f "$SCRATCH_CLONE/.loss-check.py"
+  fi
 fi
 
 NEW_CUSTOM_SHA="$(git -C "$SCRATCH_CLONE" rev-parse HEAD)"
