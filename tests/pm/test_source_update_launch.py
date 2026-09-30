@@ -295,6 +295,8 @@ def test_process_spawned_by_the_update_commits_dependencies_but_not_the_tail(sou
 
 @pytest.mark.platforms("posix")
 def test_failed_real_sync_preserves_previous_selection_and_retries(source_launch, tmp_path):
+    import time
+
     root, store_python, _ = source_launch
     # Established PM installs must retain their selection, not gain legacy [all].
     pm.sync_venv(["launch-extra"], explicit=True, project_root=root)
@@ -319,6 +321,13 @@ def test_failed_real_sync_preserves_previous_selection_and_retries(source_launch
         assert set((install_state_dir(root) / "environments").iterdir()) == generations
         assert not pm.venv_is_current(project_root=root)
         assert all(marker.read_text(encoding="utf-8") == "legacy pending install" for marker in markers)
+        # Two failures reaches the backoff threshold, so a relaunch INSIDE the window
+        # now correctly skips the tail (test_capped_completion_attempts_leave_marker_for_explicit_update).
+        # Age the record instead, as a relaunch hours later really is, so the repair path runs.
+        attempts = venv_sync._completion_attempts_path(root)
+        if attempts.is_file():
+            stale = time.time() - venv_sync.COMPLETION_RETRY_BACKOFF_SECONDS - 1
+            os.utime(attempts, (stale, stale))
 
     lock.write_bytes(valid_lock + b"\n# corrected source update\n")
     assert venv_sync.prepare_launch(root, []) == store_python
