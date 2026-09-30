@@ -584,6 +584,35 @@ def test_pythonpath_descendants_are_not_owned():
     assert env["PYTHONPATH"].split(os.pathsep) == entries
 
 
+def test_pythonpath_superseded_generation_is_owned(tmp_path, monkeypatch):
+    """A PM generation that is neither ``sys.prefix`` nor ``selected_venv`` is still
+    Hermes-owned, so its site-packages must not survive the strip.
+
+    Regression: a superseded generation's ``python3.14/site-packages`` reached an
+    external python3.12 CLI, which then found no compiled part for its ABI
+    (``ModuleNotFoundError: No module named 'rpds.rpds'`` from inside an intact
+    package). A generation's ``workspace`` stays a user path.
+    """
+    generations = tmp_path / "install" / "environments"
+    stale = generations / "deadbeef" / "venv" / "lib" / "python3.14" / "site-packages"
+    stale.mkdir(parents=True)
+    workspace = generations / "deadbeef" / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(pp, "_hermes_generation_roots", lambda: (generations,))
+
+    env = {"PYTHONPATH": os.pathsep.join([str(stale), str(workspace)])}
+    pp._strip_hermes_owned_pythonpath(env)
+
+    assert env["PYTHONPATH"].split(os.pathsep) == [str(workspace)]
+
+
+def test_generation_roots_resolve_this_install():
+    """Ownership is only useful if the real install's ``environments`` dir is found."""
+    roots = pp._hermes_generation_roots()
+    assert all(root.name == "environments" for root in roots)
+    assert all(root.is_dir() for root in roots)
+
+
 @pytest.mark.platforms("linux", "macos", "windows")
 @pytest.mark.parametrize("link_at", ["home", "repo", "unrelated"])
 @pytest.mark.parametrize("profile", [False, True])
