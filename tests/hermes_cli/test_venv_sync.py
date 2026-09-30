@@ -177,3 +177,64 @@ class TestCliContract:
 
         assert proc.returncode == 1
         assert json.loads(proc.stdout)["state"] == "failed"
+
+def test_every_failed_tail_path_counts_an_attempt(tmp_path, monkeypatch):
+    """The pending marker is armed BEFORE the tail runs, so the marker alone cannot
+    tell "never tried" from "tried and failed N times" -- the counter beside it is the
+    only record that can. Only a nonzero child exit used to write one, so a dependency
+    sync that RAISED left the marker with no counter; completion_retry_state then read
+    attempts=0 ("never tried") and the cap and its backoff never engaged, re-running the
+    whole tail on every launch. Measured shape on sma: a pending marker with no
+    source-completion-attempts file beside it.
+
+    Patched at the boundary so this proves the recording, not a real dependency build.
+    """
+    root = tmp_path / "source"
+    root.mkdir()
+    monkeypatch.setattr(venv_sync, "completion_pending_path",
+                        lambda project: tmp_path / "source-completion-pending")
+
+    def raising(*_args, **_kwargs):
+        raise OSError("the dependency sync could not reach the index")
+
+    monkeypatch.setattr(venv_sync, "_finish_source_update_attempted", raising)
+
+    record = tmp_path / "source-completion-attempts"
+    for expected in ("1", "2", "3"):
+        with pytest.raises(OSError):
+            venv_sync._finish_source_update(root, current=True, pending=tmp_path / "pending")
+        assert record.read_text(encoding="utf-8").strip() == expected
+
+    # Three consecutive failures: two past the first, so the backoff window is in force.
+    may_retry, attempts, backoff = venv_sync.completion_retry_state(root)
+    assert (may_retry, attempts) == (False, 3)
+    assert backoff > 0
+
+    # A success clears the record, so a later failure starts counting again. Production
+    # does that with clear_completion() inside the tail, which is what the stub mirrors.
+    monkeypatch.setattr(venv_sync, "_finish_source_update_attempted",
+                        lambda root_, **_k: venv_sync.clear_completion(root_))
+    venv_sync._finish_source_update(root, current=True, pending=tmp_path / "pending")
+    assert not record.exists(), "a success must clear the attempt record"
+    assert venv_sync.completion_retry_state(root) == (True, 0, 0)
+
+    # And the record comes back on the next failure: the count restarts, never sticks.
+    monkeypatch.setattr(venv_sync, "_finish_source_update_attempted", raising)
+    with pytest.raises(OSError):
+        venv_sync._finish_source_update(root, current=True, pending=tmp_path / "pending")
+    assert record.read_text(encoding="utf-8").strip() == "1"
+
+
+def test_the_cap_stops_self_starting_once_attempts_are_recorded(tmp_path, monkeypatch):
+    """With the counter engaging, the existing cap finally bites: past
+    COMPLETION_RETRY_MAX_ATTEMPTS no launch may re-run the tail on its own."""
+    root = tmp_path / "source"
+    root.mkdir()
+    monkeypatch.setattr(venv_sync, "completion_pending_path",
+                        lambda project: tmp_path / "source-completion-pending")
+    (tmp_path / "source-completion-attempts").write_text(
+        f"{venv_sync.COMPLETION_RETRY_MAX_ATTEMPTS}\n", encoding="utf-8")
+
+    may_retry, attempts, _backoff = venv_sync.completion_retry_state(root)
+
+    assert (may_retry, attempts) == (False, venv_sync.COMPLETION_RETRY_MAX_ATTEMPTS)

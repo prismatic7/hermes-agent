@@ -158,3 +158,48 @@ def test_recent_warnings_is_bounded_and_newest_first(tmp_path, monkeypatch):
     rows = receipt.recent_warnings(limit=3)
 
     assert [r["message"] for r in rows] == ["w7", "w6", "w5"]
+
+
+def _two_homes_with_one_collision(tmp_path):
+    """A colliding buildable pair plus one innocent member, in two live homes."""
+    import hermes_yaml as yaml
+
+    default_home = tmp_path / "home"
+    profile_home = tmp_path / "profiles" / "secondary"
+    profile_home.mkdir(parents=True)
+    collided = [
+        _buildable(default_home / "plugins" / "shared", "hermes-shared"),
+        _buildable(profile_home / "plugins" / "shared", "hermes-shared"),
+    ]
+    innocent = _buildable(default_home / "plugins" / "innocent", "hermes-innocent")
+    for home, names in ((default_home, ["shared", "innocent"]), (profile_home, ["shared"])):
+        with (home / "config.yaml").open("w", encoding="utf-8") as handle:
+            yaml.safe_dump({"plugins": {"enabled": names}}, handle)
+    return default_home, collided, innocent
+
+
+def test_enabled_member_dirs_drops_a_colliding_pair_for_every_caller(tmp_path, monkeypatch):
+    """The set Venv.apply BUILDS and the set Venv.expected_stamp HASHES are one call.
+
+    The eviction path filtered the collision out of its own list while every other
+    caller kept asking enabled_member_dirs() for the unfiltered one. The selection then
+    could not be built (uv refuses a workspace holding one name twice) yet the currency
+    probe still read it as merely "not current", so the source-update completion tail
+    re-ran on every launch and minted a generation per launch. The filter has to live in
+    the shared function or the two stamps never agree.
+    """
+    import pm.environments
+    import pm.plugins_state as pstate
+    from pm.workspace import enabled_member_dirs
+
+    default_home, collided, innocent = _two_homes_with_one_collision(tmp_path)
+    # dependency_homes() imports this name lazily, so patch where it is looked up.
+    monkeypatch.setattr(pm.environments, "dependency_home_root", lambda: default_home)
+    monkeypatch.setattr(pstate, "_profiles_root", lambda: tmp_path / "profiles")
+
+    members = enabled_member_dirs()
+
+    assert members == [innocent], "the colliding pair sits out; the innocent member stays"
+    assert all(path.resolve() not in _colliding_members([(path.parent, path.name, path)
+                                                         for path in members])
+               for path in members), "what survives the filter can never collide again"

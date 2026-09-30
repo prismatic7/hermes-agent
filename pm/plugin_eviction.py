@@ -177,18 +177,58 @@ class PluginEviction:
             durable_write_bytes(path, proposed)
 
 
+def _discard_generation(package, result) -> None:
+    """Reclaim the generation a speculative build just minted but nobody selected.
+
+    ``apply`` only cleans up after a FAILURE. A trial that succeeds still leaves a
+    complete generation on disk, unselected and unrecorded, so nothing will ever build
+    from it -- it is pure disk cost (hundreds of MiB) that only the collector's 86400 s
+    age floor would eventually reach. A trial's own generation is the one generation the
+    trial can prove is nobody's: it was minted seconds ago under this call and no commit
+    has named it yet. Still checked rather than assumed -- selection and leases are read
+    from disk, and a generation this function cannot prove is unused is left alone.
+    """
+    environment = (result or {}).get("environment")
+    if environment is None:
+        return
+    from pm.environments import install_state_dir, selected_venv
+
+    generation = Path(environment).parent
+    root = install_state_dir(package.project_root()) / "environments"
+    if generation.parent.resolve() != root.resolve():
+        return
+    try:
+        if generation.resolve() == selected_venv(package.project_root()).parent.resolve():
+            return
+    except (OSError, RuntimeError, ValueError):
+        return
+    from hermes_cli.runtime_state import leases_held
+
+    try:
+        if leases_held(generation):
+            return
+    except OSError:
+        return
+    from hermes_cli.fs_utils import rmtree_force
+
+    rmtree_force(generation)
+
+
 def _trial(package, enabled, explicit: bool, plugin_dirs: list[Path]) -> str | None:
     """Why the last of *plugin_dirs* cannot join the build, or None when it builds."""
     cause = ""
     # A fetch or tooling failure can be the moment rather than the plugin: one more try.
     for _attempt in range(2):
         try:
-            package.apply(enabled, explicit=explicit, plugin_dirs=plugin_dirs, skip_invalid_secondary=True)
-            return None
+            result = package.apply(enabled, explicit=explicit, plugin_dirs=plugin_dirs,
+                                   skip_invalid_secondary=True)
         except (ResolutionConflict, BuildFailure) as exc:
             return f"the dependency environment no longer builds with it: {exc.cause[-400:]}"
         except InstallError as exc:
             cause = exc.cause
+            continue
+        _discard_generation(package, result)
+        return None
     return f"its dependencies could not be prepared, twice: {cause[-400:]}"
 
 
@@ -237,10 +277,14 @@ def sync_evicting(package, facts, fact: dict, *, extras, shipped, frozen, explic
             raise
         enabled = _target_selection(package, fact, extras=extras, inputs={"plugin_dirs": []},
                                     repair=False, shipped=shipped, frozen=frozen)[0]
+        # Core alone is built to prove the PLUGINS are the cause, not to keep it: the
+        # commit() below is what publishes, so this generation is reclaimed here too.
+        # One invocation used to mint 1 + 1 + 2N; the two speculative builds are now free.
         try:
-            package.apply(enabled, explicit=explicit, plugin_dirs=[], skip_invalid_secondary=True)
+            proof = package.apply(enabled, explicit=explicit, plugin_dirs=[], skip_invalid_secondary=True)
         except InstallError:
             raise failure from None
+        _discard_generation(package, proof)
         fitting: list[Path] = []
         for member in kept:
             reason = _trial(package, enabled, explicit, [*fitting, member])

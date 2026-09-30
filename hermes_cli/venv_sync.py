@@ -411,7 +411,27 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
 
 
 def _finish_source_update(root: Path, *, current: bool, pending: Path) -> None:
-    """Sync dependencies when they are stale, then run the tail the marker still owes."""
+    """Sync dependencies when they are stale, then run the tail the marker still owes.
+
+    EVERY failure of the owed tail bumps the attempt record, not just a nonzero child
+    exit: the marker is armed before the tail runs, so any other path out of here (a
+    raising dependency sync, a lock refusal) used to leave the marker with no counter
+    at all -- that reads as "never tried", so the retry cap and its backoff never
+    engaged and every launch re-ran the whole tail.
+    """
+    import sys
+    from hermes_cli._early_recovery import _marker_owner_is_live
+    from pm.environments import activation_environment
+
+    try:
+        return _finish_source_update_attempted(root, current=current, pending=pending)
+    except BaseException:
+        _record_completion_attempt(root, failed=True)
+        raise
+
+
+def _finish_source_update_attempted(root: Path, *, current: bool, pending: Path) -> None:
+    """The tail itself; the caller records one attempt for however this exits."""
     import sys
     from hermes_cli._early_recovery import _marker_owner_is_live
     from pm.environments import activation_environment
@@ -446,7 +466,6 @@ def _finish_source_update(root: Path, *, current: bool, pending: Path) -> None:
         cwd=root, env=activation_environment(root), stdout=sys.__stderr__,
     )
     if code != 0:
-        _record_completion_attempt(root, failed=True)
         raise RuntimeError(
             "source update completion failed; run `hermes update` to finish it"
         )

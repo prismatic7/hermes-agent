@@ -181,8 +181,27 @@ def lease_directory(generation: Path) -> Callable[[], None]:
     return release
 
 
-def collect_generations(project: Path, *, min_age_seconds: float = 86400) -> list[Path]:
-    """Remove unselected lease-managed generations after their readers exit."""
+#: Newest eligible generations kept when the count cap applies. The cap only ever
+#: narrows a set that ALREADY passed all four safety conditions, so it can never reach
+#: a generation the age floor protects.
+GENERATION_KEEP_COUNT = 20
+
+
+def collect_generations(project: Path, *, min_age_seconds: float = 86400,
+                        max_generations: int | None = GENERATION_KEEP_COUNT) -> list[Path]:
+    """Remove unselected lease-managed generations after their readers exit.
+
+    Four conditions decide safety and ALL FOUR still hold for anything removed here: the
+    generation carries ``.lease-managed``, its marker is at least *min_age_seconds* old,
+    no process holds a lease (``leases_held``), and it is not the selected generation.
+    The age floor is one of those conditions on purpose -- a process can sit between
+    selecting a generation and leasing it -- so this collector CANNOT bound a same-day
+    burst and must not try to: a burst is bounded on the MINT side, by a selection that
+    stops changing every launch. What the count cap adds is an upper bound on the AGED
+    hoard, which otherwise grows for ever: once the eligible set is larger than
+    *max_generations*, the oldest excess goes. ``max_generations=None`` restores the
+    pure age-floor behaviour.
+    """
     from pm.environments import selected_venv
     removed = []
     root = install_state_dir(project)
@@ -196,15 +215,29 @@ def collect_generations(project: Path, *, min_age_seconds: float = 86400) -> lis
         generations = root / "environments"
         if not generations.is_dir():
             return removed
+        eligible: list[Path] = []
         for generation in generations.iterdir():
             if generation.is_symlink() or not generation.is_dir() or generation.resolve() == selected:
                 continue
             marker = generation / ".lease-managed"
             if not marker.is_file() or time.time() - marker.stat().st_mtime < min_age_seconds:
                 continue
-            if not leases_held(generation):
-                shutil.rmtree(generation)
-                removed.append(generation)
+            if leases_held(generation):
+                continue
+            eligible.append(generation)
+        victims = eligible
+        if max_generations is not None and len(eligible) > max_generations:
+            # Newest kept: the older a generation is, the longer every reader has had to
+            # take its lease, so the tail of the aged list is the safest to drop.
+            newest_first = sorted(
+                eligible,
+                key=lambda generation: (generation / ".lease-managed").stat().st_mtime,
+                reverse=True,
+            )
+            victims = newest_first[max_generations:]
+        for generation in victims:
+            shutil.rmtree(generation)
+            removed.append(generation)
     return removed
 
 

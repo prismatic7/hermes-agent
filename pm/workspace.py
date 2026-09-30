@@ -271,6 +271,16 @@ def enabled_member_dirs(*, proposed_home=None, enabled=None, disabled=None) -> l
     verdict is only as good as our version identity (an untagged source checkout reads
     as an older release), the loader skips that plugin anyway, and the member rejoins
     as soon as the verdict flips. Enabling one is still refused at admission.
+
+    Buildable members that would declare one ``[project].name`` twice in this selection
+    sit out too, and it MUST be this function that decides it: uv refuses the WHOLE
+    workspace, so such a selection can never be built, and every caller has to name the
+    same set or their hashes disagree. The eviction path knew that first and passed its
+    own filtered list while ``Venv.apply``/``Venv.expected_stamp`` kept asking for the
+    unfiltered one: the stamp a build recorded therefore never matched the stamp the next
+    boot computed, so the dependency sync was never "current" and the source-update
+    completion tail (products, desktop rebuild) re-ran on EVERY launch, minting a
+    generation per launch that the 86400 s gc floor cannot reclaim same-day.
     """
     selected = enabled_plugin_dirs(proposed_home=proposed_home, enabled=enabled, disabled=disabled,
                                    skip_invalid_secondary=proposed_home is None)
@@ -287,6 +297,12 @@ def enabled_member_dirs(*, proposed_home=None, enabled=None, disabled=None) -> l
             raise InstallError("venv", reason)
         if declaration.is_member:
             members.append(path)
+    if len(members) > 1:
+        from pm.plugin_eviction import _colliding_members
+
+        collisions = _colliding_members([(path.parent, path.name, path) for path in members])
+        if collisions:
+            members = [path for path in members if path.resolve() not in collisions]
     return members
 
 

@@ -591,3 +591,42 @@ def test_failed_tail_attempt_is_counted_and_success_clears_it(source_launch, tmp
     assert not completion_pending_path(root).exists()
     assert not _completion_attempts_path(root).exists(), "success cleared the attempt record"
 
+
+@pytest.mark.platforms("posix")
+def test_dependency_sync_failure_counts_as_a_tail_attempt(source_launch, tmp_path):
+    """A tail that fails while SYNCING its dependencies must still count.
+
+    The pending marker is armed before the tail runs, so the marker alone cannot tell
+    "never tried" from "tried and failed N times" -- the counter is the only record that
+    can. Only a nonzero child exit used to write one, so a raising dependency sync left
+    the marker with NO counter beside it; completion_retry_state then read that as
+    attempts=0 ("never tried") and the cap and its backoff never engaged, re-running the
+    whole tail on every launch. This is the measured shape on sma: a pending marker with
+    no source-completion-attempts file beside it.
+    """
+    from hermes_cli.venv_sync import _completion_attempts_path, completion_retry_state
+
+    root, _store_python, _ = source_launch
+    pm.sync_venv(["all"], explicit=True, project_root=root)
+    previous = _fact(root)
+    lock = root / "uv.lock"
+    lock.write_text("version = 1\nnot valid TOML\n", encoding="utf-8")
+    assert not pm.venv_is_current(project_root=root)
+
+    # A metadata-free launch owes the tail; its dependency sync cannot finish.
+    with pytest.raises(Exception):
+        venv_sync.prepare_launch(root, [])
+
+    record = _completion_attempts_path(root)
+    assert record.is_file(), "a failed tail left no attempt record -- the cap cannot engage"
+    assert record.read_text(encoding="utf-8").strip() == "1"
+    assert venv_sync.completion_pending_path(root).is_file(), "the obligation is still owed"
+    assert _fact(root) == previous, "a failed sync must not move the recorded selection"
+
+    # A second failure increments: the backoff window is now in force.
+    with pytest.raises(Exception):
+        venv_sync.prepare_launch(root, [])
+    assert record.read_text(encoding="utf-8").strip() == "2"
+    may_retry, attempts, backoff = completion_retry_state(root)
+    assert (may_retry, attempts) == (False, 2)
+    assert backoff > 0, "two consecutive failures must back the tail off"
