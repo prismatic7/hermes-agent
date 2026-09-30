@@ -127,6 +127,25 @@ def _strip_hermes_owned_pythonpath_and_runtime_markers(env: dict) -> None:
         env.pop(_marker, None)
 
 
+def _sealed_payload_generations(generations: Path) -> bool:
+    """True when *generations* is a sealed payload's own dependency tree, not PM's.
+
+    A payload ships its environment beside its bundle manifest, so
+    ``<payload>/state/environments/<name>/venv`` is the payload's runtime rather than a PM
+    generation. Manifest existence is the same test ``pm.install.sealed`` and
+    ``pm.environments.store_root`` use to recognise a payload root, and the probe is
+    deliberately shallow: PM's own generations live under the per-install state dir
+    (``<HERMES_HOME>/installs/<key>/environments``), whose parents carry no manifest.
+    """
+    for root in (generations.parent, generations.parent.parent):
+        try:
+            if (root / "manifest.json").is_file():
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def _hermes_generation_roots() -> tuple[Path, ...]:
     """``<install>/environments`` — the dir PM writes every dependency generation under.
 
@@ -136,7 +155,11 @@ def _hermes_generation_roots() -> tuple[Path, ...]:
     a provenance test built from those two alone does not recognise it. A superseded
     ``pythonX.Y/site-packages`` then reaches a child interpreter of a different version and
     its compiled extension modules vanish (``ModuleNotFoundError`` from inside an
-    otherwise-intact package)."""
+    otherwise-intact package).
+
+    Empty for a sealed payload (see :func:`_sealed_payload_generations`): its own runtime
+    lives under the payload's state dir and must survive the strip, while a superseded PM
+    generation still must not."""
     try:
         from pm.environments import install_state_dir
 
@@ -144,7 +167,9 @@ def _hermes_generation_roots() -> tuple[Path, ...]:
         generations = generations.resolve()
     except Exception:
         return ()
-    return (generations,) if generations.is_dir() else ()
+    if not generations.is_dir() or _sealed_payload_generations(generations):
+        return ()
+    return (generations,)
 
 
 def _is_hermes_generation_entry(entry: str, generation_roots: tuple[Path, ...]) -> bool:
@@ -177,7 +202,8 @@ def _strip_hermes_owned_pythonpath(env: dict) -> None:
     test alone lets a dead pythonX.Y site-packages through -- and an external child interpreter
     of another version then loads that generation's compiled extensions and breaks. PM writes
     nothing else under ``environments/``, so claiming the ``venv`` subtree is provenance, not a
-    version heuristic.
+    version heuristic. That claim is skipped entirely for a sealed payload's state dir, whose
+    ``environments`` tree is the payload's own runtime rather than a PM generation.
     """
     pp = env.get("PYTHONPATH")
     if not pp:

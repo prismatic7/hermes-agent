@@ -484,7 +484,9 @@ def strip_launch_profile_env(env: dict, target_home: "str | Path | None" = None)
     # overlay puts back exactly the ones the target's own sources supply. The administrator-managed
     # .env is NOT residue: its values are policy for every profile (``_apply_managed_env`` applies
     # it last, with override, so it beats the user's own .env) — leave them in place.
-    from hermes_cli.env_loader import launch_dotenv_keys, managed_dotenv_keys, source_supplied_names
+    from hermes_cli.env_loader import (
+        launch_dotenv_keys, managed_dotenv_keys, sibling_profile_dotenv_values,
+        source_supplied_names)
     managed_names = {key.upper() for key in managed_dotenv_keys()}
     residue_names = {
         key.upper() for key in
@@ -493,6 +495,12 @@ def strip_launch_profile_env(env: dict, target_home: "str | Path | None" = None)
         if not _is_global_env(key.upper()) or key.upper().startswith("TERMINAL_")} - managed_names
     for key in [k for k in env if k.upper() in residue_names]:
         del env[key]
+    # A sibling profile .env loaded into the shared environ by a routed-home work scope is
+    # residue too, and the only residue with no launch-side bookkeeping to name it (t_75d553f5).
+    # Value-matched: a name the launch shell exported is not a sibling's residue and survives.
+    for name, values in sibling_profile_dotenv_values(target).items():
+        if env.get(name) in values:
+            del env[name]
     # Authorization gates are the one residue a name list cannot see: a unit-file ``Environment=``
     # or an operator export never appears in the launch ``.env``, the secret scrub ignores
     # non-credentials, and the target's own ``.env`` rarely defines the key to overwrite it (#113270).
