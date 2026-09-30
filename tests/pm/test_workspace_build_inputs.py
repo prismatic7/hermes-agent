@@ -1,6 +1,7 @@
 """Workspace generation carries the source inputs of a buildable core."""
 import json
 from pathlib import Path
+import os
 import shutil
 import subprocess
 import sys
@@ -282,3 +283,42 @@ def test_nested_dist_travels_but_root_dist_stays_out(tmp_path):
 
     assert (destination / "plugins/kanban/dashboard/dist/index.js").read_text(encoding="utf-8") == "ENTRY\n"
     assert not (destination / "dist").exists(), "root build output never enters the snapshot"
+
+
+def _git_member(root: Path) -> Path:
+    """A member checkout whose plugin keeps its runtime state inside its own directory."""
+    member = root / "curator"
+    (member / "pkg").mkdir(parents=True)
+    (member / "pyproject.toml").write_text('[project]\nname="curator"\nversion="1"\n', encoding="utf-8")
+    (member / ".gitignore").write_text("data/\n*.sqlite\n", encoding="utf-8")
+    (member / "pkg" / "__init__.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (member / "README.md").write_text("readme\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=member, check=True)
+    subprocess.run(["git", "add", "."], cwd=member, check=True,
+                   env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=member, check=True,
+                   env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+    return member
+
+
+def test_member_runtime_data_never_moves_the_stamp(tmp_path):
+    """A member's own ignored state (logs, caches, a live SQLite DB) is not a build input.
+
+    install._commit_selection compares the stamp it built the generation against with one
+    taken after the build; hashing ignored state made that comparison fail forever with
+    "Dependency inputs changed while preparing publication".
+    """
+    member = _git_member(tmp_path)
+    (member / "data").mkdir()
+    live = member / "data" / "evidence.sqlite"
+    live.write_bytes(b"one")
+
+    first = workspace.members_stamp([member])
+    live.write_bytes(b"two" * 5000)
+    assert workspace.members_stamp([member]) == first, "runtime state moved the stamp"
+
+    # The same data path must not move it either — a real edit to a build input must.
+    (member / "pkg" / "__init__.py").write_text("VALUE = 2\n", encoding="utf-8")
+    assert workspace.members_stamp([member]) != first, "a real build input stopped counting"

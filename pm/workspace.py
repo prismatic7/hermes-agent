@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
@@ -25,6 +26,49 @@ _MEMBER_EXCLUDE = frozenset({".git", ".venv", "venv", "node_modules", "__pycache
 
 def _member_ignored(directory, names):
     return [name for name in names if name in _MEMBER_EXCLUDE or name.endswith(".egg-info")]
+
+
+def _vcs_excluded_paths(entry: Path) -> set:
+    """Paths git reports as ignored or untracked under ``entry`` — never build inputs.
+
+    A member holds the plugin's OWN runtime state inside its directory: logs, caches,
+    and a SQLite database rewritten on every run. ``members_stamp`` hashed that too, so
+    the stamp differed between the two calls ``install._commit_selection`` compares —
+    the one that builds the generation and the one that re-checks it. Every dependency
+    sync involving such a member failed with "Dependency inputs changed while preparing
+    publication; retry", no matter how often it was retried.
+
+    Hash only what the build copies, which is exactly the complement of this set: a
+    plugin checkout's non-ignored files are the tracked ones. Git collapses an excluded
+    directory to one entry, so this stays cheap however large the data dir grows.
+
+    Empty on any git failure — this narrows what is hashed, so an unavailable VCS walks
+    the tree as before rather than skipping the member's real build inputs.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(entry), "status", "--porcelain", "--ignored=matching",
+             "--untracked-files=normal", "-z"],
+            capture_output=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    return _parse_status_paths(result.stdout) if result.returncode == 0 else set()
+
+
+def _parse_status_paths(raw: bytes) -> set:
+    """Every ignored/untracked path from ``git status --porcelain -z`` output."""
+    excluded = set()
+    for record in raw.decode("utf-8", "surrogateescape").split("\0"):
+        # "XY <path>"; an untracked/ignored entry is '??' or '!!'.
+        if len(record) < 4 or record[:2] not in ("??", "!!"):
+            continue
+        name = record[3:].strip("/")
+        while name.startswith("./"):
+            name = name[2:]
+        if name:
+            excluded.add(name)
+    return excluded
 
 
 # The uv failure classifier lives beside the uv runner (stdlib-only imports): the bootstrap
@@ -51,9 +95,14 @@ def members_stamp(plugin_dirs) -> str:
             h.update(source.read_bytes())
             h.update(b"\0")
         if (entry / "pyproject.toml").is_file():
+            excluded = _vcs_excluded_paths(entry) if (entry / ".git").is_dir() else set()
             for directory, dirs, files in os.walk(entry):
-                dirs[:] = sorted(set(dirs) - set(_member_ignored(directory, dirs)))
-                for name in sorted(set(files) - set(_member_ignored(directory, files))):
+                relative = Path(directory).relative_to(entry).as_posix() if directory != str(entry) else ""
+                prefix = "" if relative in ("", ".") else f"{relative}/"
+                skipped = {p[len(prefix):] for p in excluded
+                           if p.startswith(prefix) and p != prefix.rstrip("/")}
+                dirs[:] = sorted(set(dirs) - set(_member_ignored(directory, dirs)) - skipped)
+                for name in sorted(set(files) - set(_member_ignored(directory, files)) - skipped):
                     path = Path(directory) / name
                     h.update(path.relative_to(entry).as_posix().encode())
                     h.update(b"\0")
