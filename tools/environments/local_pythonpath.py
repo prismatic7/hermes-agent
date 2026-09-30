@@ -127,6 +127,42 @@ def _strip_hermes_owned_pythonpath_and_runtime_markers(env: dict) -> None:
         env.pop(_marker, None)
 
 
+def _hermes_generation_roots() -> tuple[Path, ...]:
+    """``<install>/environments`` — the dir PM writes every dependency generation under.
+
+    Missing from the ownership test below until now, which is the leak: a generation other
+    than ``sys.prefix``'s and the one ``facts.json`` currently selects is written by
+    ``pm.environments.activate_dependencies`` straight onto ``os.environ['PYTHONPATH']``, and
+    a provenance test built from those two alone does not recognise it. A superseded
+    ``pythonX.Y/site-packages`` then reaches a child interpreter of a different version and
+    its compiled extension modules vanish (``ModuleNotFoundError`` from inside an
+    otherwise-intact package)."""
+    try:
+        from pm.environments import install_state_dir
+
+        generations = (install_state_dir(Path(__file__).resolve().parents[2]) / "environments")
+        generations = generations.resolve()
+    except Exception:
+        return ()
+    return (generations,) if generations.is_dir() else ()
+
+
+def _is_hermes_generation_entry(entry: str, generation_roots: tuple[Path, ...]) -> bool:
+    """True when *entry* sits under ``<install>/environments/<generation>/venv``.
+
+    PM owns that subtree exclusively, so a PYTHONPATH entry inside it is Hermes-owned no
+    matter which generation is live. Only ``venv`` is claimed — a generation's ``workspace``
+    stays a user path, matching the "never descendants" rule in the caller."""
+    for generations in generation_roots:
+        try:
+            relative = Path(entry).resolve().relative_to(generations)
+        except (OSError, ValueError):
+            continue
+        if len(relative.parts) >= 2 and relative.parts[1] == "venv":
+            return True
+    return False
+
+
 def _strip_hermes_owned_pythonpath(env: dict) -> None:
     """Remove Hermes-owned PYTHONPATH entries: only exact matches of the repo root
     (any launcher spelling) and runtime site-packages — never descendants, which are
@@ -135,13 +171,29 @@ def _strip_hermes_owned_pythonpath(env: dict) -> None:
     Everything else -- user libs, Nix plugin paths, a pythonX.Y/site-packages entry meant for a DIFFERENT
     child version -- is preserved byte-for-byte: ownership is decided by path provenance, never by a
     cross-version heuristic (#74817 follow-up).
+
+    One deliberate exception to "never descendants": ``environments/<generation>/venv``.
+    A superseded generation is neither ``sys.prefix`` nor ``selected_venv``, so the exact-match
+    test alone lets a dead pythonX.Y site-packages through -- and an external child interpreter
+    of another version then loads that generation's compiled extensions and breaks. PM writes
+    nothing else under ``environments/``, so claiming the ``venv`` subtree is provenance, not a
+    version heuristic.
     """
     pp = env.get("PYTHONPATH")
     if not pp:
         return
     owned_paths = [*_get_hermes_site_packages(env), *_state()._hermes_repo_root_aliases]
+    generation_roots = _hermes_generation_roots()
     entries = pp.split(os.pathsep)
-    stripped = [e for e in entries if e and any(_same_path(Path(e), p) for p in owned_paths)]
+    stripped = [
+        e
+        for e in entries
+        if e
+        and (
+            any(_same_path(Path(e), p) for p in owned_paths)
+            or _is_hermes_generation_entry(e, generation_roots)
+        )
+    ]
     kept = [e for e in entries if e not in stripped]
     if kept:
         env["PYTHONPATH"] = os.pathsep.join(kept)
