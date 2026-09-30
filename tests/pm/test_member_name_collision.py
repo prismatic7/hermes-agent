@@ -178,6 +178,93 @@ def _two_homes_with_one_collision(tmp_path):
     return default_home, collided, innocent
 
 
+def test_a_speculative_build_is_reclaimed_only_when_provably_unused(tmp_path, monkeypatch):
+    """`_discard_generation` DELETES a generation, so its proof has to be real.
+
+    A trial build (`_trial`) and the core-alone proof in `sync_evicting` each mint a
+    full generation that nothing will ever select; `apply()` only cleans up after a
+    FAILURE, so every SUCCESSFUL trial leaked one. sync_evicting minted 1 + 1 + 2N per
+    invocation and kept them all. Reclaiming is only safe for a generation this call
+    can prove is nobody's, so each refusal below is exercised explicitly: a generation
+    outside the environments dir, the selected one, and one a live reader holds.
+    """
+    import json
+
+    from pm import plugin_eviction
+    from pm.environments import install_state_dir, runtime_facts_path
+    from hermes_cli.runtime_state import lease_directory
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+
+    class Package:
+        @staticmethod
+        def project_root():
+            return repo
+
+    state = install_state_dir(repo)
+    environments = state / "environments"
+
+    def mint(name, *, readable=True):
+        venv = environments / name / "venv"
+        venv.mkdir(parents=True)
+        if readable:
+            # A real venv layout: `selected_venv` refuses an installation it cannot
+            # recognize, and an unreadable selection makes the helper fail closed.
+            (venv / "pyvenv.cfg").write_text("version = 3.11")
+        (venv.parent / ".lease-managed").touch()
+        return venv
+
+    def select(name):
+        runtime_facts_path(repo).write_text(json.dumps(
+            {"packages": {"venv": {"environment": str(environments / name / "venv")}}}),
+            encoding="utf-8")
+
+    selected = mint("selected")
+    select("selected")
+
+    # 1. A fresh, unselected, unleased generation IS reclaimed: the point of the helper.
+    trial = mint("trial")
+    plugin_eviction._discard_generation(Package(), {"environment": trial})
+    assert not trial.exists(), "an unselected, unleased trial generation must be reclaimed"
+
+    # 2. The selected generation is never a victim, whatever the caller passes.
+    plugin_eviction._discard_generation(Package(), {"environment": selected})
+    assert selected.exists(), "the selected generation must never be reclaimed"
+
+    # 3. A generation a live reader holds is never a victim either.
+    held = mint("held")
+    release = lease_directory(held.parent)
+    try:
+        plugin_eviction._discard_generation(Package(), {"environment": held})
+        assert held.exists(), "a generation with a live lease must never be reclaimed"
+    finally:
+        release()
+    plugin_eviction._discard_generation(Package(), {"environment": held})
+    assert not held.exists(), "once the reader exits the generation is reclaimable"
+
+    # 4. A path outside the install's environments dir is left alone.
+    outside = tmp_path / "elsewhere" / "venv"
+    outside.mkdir(parents=True)
+    plugin_eviction._discard_generation(Package(), {"environment": outside})
+    assert outside.exists(), "a path outside the environments dir must never be touched"
+
+    # 5. No environment in the result (a no-op apply) is not a delete.
+    plugin_eviction._discard_generation(Package(), {})
+    plugin_eviction._discard_generation(Package(), None)
+    assert sorted(p.name for p in environments.iterdir()) == ["selected"]
+
+    # 6. An UNREADABLE selection makes the helper fail closed: it cannot prove the
+    #    generation is unselected, so it must keep it rather than guess.
+    opaque = mint("opaque", readable=False)
+    runtime_facts_path(repo).write_text(json.dumps(
+        {"packages": {"venv": {"environment": str(opaque)}}}), encoding="utf-8")
+    kept = mint("kept-when-opaque")
+    plugin_eviction._discard_generation(Package(), {"environment": kept})
+    assert kept.exists(), "an unreadable selection must not licence a delete"
+
+
 def test_enabled_member_dirs_drops_a_colliding_pair_for_every_caller(tmp_path, monkeypatch):
     """The set Venv.apply BUILDS and the set Venv.expected_stamp HASHES are one call.
 
