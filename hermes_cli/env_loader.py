@@ -159,6 +159,75 @@ def managed_dotenv_keys() -> frozenset[str]:
     return frozenset(_MANAGED_DOTENV_KEYS)
 
 
+
+
+def sibling_profile_dotenv_values(target_home: str | os.PathLike | None = None) -> dict[str, frozenset]:
+    """Map of ``name -> values SIBLING profile homes declare for it``, excluding *target_home*'s own.
+
+    ``os.environ`` is process-wide and dotenv never unsets (see ``_LOADED_DOTENV_KEYS`` and
+    ``_SECRET_SOURCE_WRITES_BY_HOME`` above). When a dispatcher resolves a ROUTED profile's home on
+    this process's behalf (``_default_spawn`` -> ``_resolve_worker_cli_toolsets`` ->
+    ``_worker_profile_scope(bind_home=True)`` -> ``load_hermes_dotenv()``) that home's ``.env`` is
+    loaded with ``override=True`` into the shared environ and OUTLIVES the work that needed it. The
+    name has no provenance in THIS process's launch bookkeeping (not in the launch home's ``.env``,
+    not in ``launch_dotenv_keys()``, not ``TERMINAL_*``, not source-supplied), so
+    ``strip_launch_profile_env``'s launch-side lists cannot see it, and the target profile's own
+    scope overlay only ADDS values -- it never removes the sibling's. Every child spawned afterwards
+    inherited a sibling's profile-scoped setting: a sysadmin kanban worker carrying enodios'
+    vault-only ``HERMES_WRITE_SAFE_ROOT``, whose file tools then refused their own workspace
+    (t_75d553f5 / t_e07685a4).
+
+    Values are carried so the caller matches on the VALUE it actually holds, not on the name: an
+    identical name the operator exported in the launch shell is not a sibling's residue and must
+    survive. Parsed through the same tokenizer as the scope builder, so two boundaries cannot
+    disagree on which keys a file defines. Empty when no profiles root resolves (an isolated
+    fixture), which keeps the caller's strip a no-op there.
+    """
+    from agent.secret_scope import load_env_file
+
+    target = None
+    if target_home:
+        try:
+            target = Path(target_home).resolve()
+        except OSError:
+            target = None
+    roots: list[Path] = []
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        roots.append(Path(get_default_hermes_root()))
+    except Exception:  # noqa: BLE001 -- bookkeeping must never block a spawn
+        pass
+    if target is not None and target.parent.name == 'profiles':
+        roots.append(target.parent.parent)
+
+    declared: dict[str, set[str]] = {}
+    seen: set[str] = set()
+    for root in roots:
+        profiles_dir = root / 'profiles'
+        try:
+            if not profiles_dir.is_dir():
+                continue
+            candidates = sorted(profiles_dir.iterdir())
+        except OSError:
+            continue
+        for home in candidates:
+            env_path = home / '.env'
+            try:
+                if not home.is_dir() or not env_path.is_file():
+                    continue
+                resolved = home.resolve()
+            except OSError:
+                continue
+            if resolved == target or str(resolved) in seen:
+                continue
+            seen.add(str(resolved))
+            for name, value in load_env_file(env_path).items():
+                if value is None:
+                    continue
+                declared.setdefault(name, set()).add(str(value))
+    return {name: frozenset(values) for name, values in declared.items()}
+
 def get_secret_source_values(hermes_home: str | os.PathLike) -> dict[str, str]:
     """Return the external-secret value snapshot for ``hermes_home``."""
     return dict(_SECRET_SOURCE_VALUES_BY_HOME.get(str(Path(hermes_home).resolve()), {}))
