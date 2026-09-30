@@ -3,6 +3,7 @@
 1. ``_pid_is_running`` must report a zombie as dead: an update marker naming an
    un-reaped child otherwise reads as a live holder forever and blocks every
    dependency sync (and, with launchd KeepAlive, rebuilds an environment each boot).
+   Upstream since implemented this as ``_process_state``; the probe below targets it.
 2. ``pm.runtime._inputs`` must tolerate a missing ``uv.lock``: the PM runtime
    ships without the lock, and read_bytes() raised FileNotFoundError instead.
 """
@@ -34,7 +35,7 @@ def test_pid_is_running_reports_a_zombie_as_dead():
                 break
             time.sleep(0.05)
         assert state.startswith("Z"), f"child never became a zombie (stat={state!r})"
-        assert er._pid_is_zombie(pid) is True
+        assert (er._process_state(pid) or "").upper().startswith("Z")
         assert er._pid_is_running(pid) is False  # the regression
     finally:
         os.waitpid(pid, 0)
@@ -43,7 +44,8 @@ def test_pid_is_running_reports_a_zombie_as_dead():
 def test_pid_is_running_still_sees_a_live_process():
     assert er._pid_is_running(os.getpid()) is True
     assert er._pid_is_running(0) is False
-    assert er._pid_is_zombie(os.getpid()) is False
+    state = er._process_state(os.getpid())
+    assert state is None or not state.upper().startswith("Z")
 
 
 def test_pm_runtime_inputs_tolerates_a_missing_lock(tmp_path):
