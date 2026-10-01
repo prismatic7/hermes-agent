@@ -180,6 +180,55 @@ fetch_live() {  # <repo> <fetch args...>
   return 1
 }
 
+# ── clear_stale_live_lock ─────────────────────────────────────────────────────
+# `git merge --ff-only` must write the index, so an orphaned .git/index.lock
+# makes it fail with "File exists" — and until 2026-10-01 this script reported
+# that failure as "fast-forward not possible (local commits on this host?)", a
+# guess that sends the reader after a divergence that was never there. Observed
+# twice (2026-09-26 and 2026-10-01), each time stalling the live checkout on
+# stale code until someone read the log by hand.
+#
+# hermes_cli/gitlock.py::clear_stale_git_locks already does this correctly, but
+# it is wired only into the `hermes update` paths — so fork-sync, the one writer
+# that moves this checkout nightly, could not clear its own blocker. Rather than
+# re-implement the sweep in bash (drift risk), invoke that Python directly: one
+# definition of "stale", already tested.
+#
+# Contract (mirrors _sweep_stale): remove ONLY when the lock is older than the
+# age floor AND no git process is running. Anything else — a fresh lock, a live
+# git, a failure to reach Python — leaves the lock alone and returns 0. This is
+# a courtesy cleanup; it must never turn a slow-but-healthy sync into a failure.
+clear_stale_live_lock() {  # <repo>
+  local repo="$1"
+  [ -f "$repo/.git/index.lock" ] || return 0
+
+  local py; py="$(command -v python3 || true)"
+  [ -n "$py" ] || py="/usr/bin/python3"
+
+  local out
+  if ! out="$("$py" - "$repo" "$HERMES_DIR" 2>&1 <<'PY'
+import sys
+sys.path.insert(0, sys.argv[2])          # keep the vendored module importable
+from pathlib import Path
+try:
+    from hermes_cli.gitlock import clear_stale_git_locks
+except Exception as exc:                  # never break a sync over cleanup
+    print(f"lock-helper unavailable: {exc.__class__.__name__}: {exc}")
+    raise SystemExit(0)
+removed = clear_stale_git_locks(Path(sys.argv[1]))
+print(("removed:" + ",".join(removed)) if removed else "kept")
+PY
+)"; then
+    echo "  NOTE: stale-lock check could not run; leaving the lock untouched."
+    return 0
+  fi
+
+  case "$out" in
+    removed:*) echo "  cleared stale git lock(s): ${out#removed:} — an orphaned lock previously failed this step with a misleading reason." ;;
+  esac
+  return 0
+}
+
 # ── Post-sync install reconcile ──────────────────────────────────────────────
 # This script moves the live checkout; it does NOT make the venv match it. Two
 # incidents in two days came from exactly that gap (see
@@ -334,7 +383,8 @@ if [ "$ROLE" = "follower" ]; then
   # but a commit in it is still work: refuse, print exactly what is at stake, and
   # let a human push it to the fork (the canonical branch) first.
   LIVE_AHEAD="$(git -C "$HERMES_DIR" rev-list --count fork/customizations..HEAD 2>/dev/null || echo '?')"
-  if git -C "$HERMES_DIR" merge --ff-only --quiet fork/customizations >/dev/null 2>&1; then
+  clear_stale_live_lock "$HERMES_DIR"
+  if FF_ERR_F="$(git -C "$HERMES_DIR" merge --ff-only --quiet fork/customizations 2>&1)"; then
     LIVE_CHANGED=true
     echo "  live checkout fast-forwarded -> $(git -C "$HERMES_DIR" rev-parse --short HEAD)"
     echo "  NOTE: restart Hermes for the updated code to load."
@@ -344,6 +394,7 @@ if [ "$ROLE" = "follower" ]; then
     finish "fork-sync[$HOST_LABEL/$ROLE] ok: customizations $(git -C "$HERMES_DIR" rev-parse --short "$LIVE_SHA") -> $(git -C "$HERMES_DIR" rev-parse --short HEAD)"
   else
     # Never reset. Report and leave the tree exactly as it is.
+    [ -n "$FF_ERR_F" ] && printf '%s\n' "$FF_ERR_F" | sed 's/^/    git: /'
     echo "  SKIP: live checkout does not descend from fork/customizations."
     echo "        local commits ahead of the fork: $LIVE_AHEAD"
     git -C "$HERMES_DIR" log --oneline fork/customizations..HEAD 2>/dev/null | sed 's/^/          /'
@@ -619,13 +670,14 @@ elif [ "$(git -C "$HERMES_DIR" rev-parse HEAD)" = "$NEW_CUSTOM_SHA" ]; then
 else
   # Fetch the freshly-merged fork ref into the live checkout, then fast-forward.
   fetch_live "$HERMES_DIR" --quiet fork customizations || fail "live fetch failed"
-  if git -C "$HERMES_DIR" merge --ff-only --quiet fork/customizations >/dev/null 2>&1; then
+  clear_stale_live_lock "$HERMES_DIR"
+  if FF_ERR="$(git -C "$HERMES_DIR" merge --ff-only --quiet fork/customizations 2>&1)"; then
     LIVE_CHANGED=true
     echo "  live checkout fast-forwarded -> $(git -C "$HERMES_DIR" rev-parse --short HEAD)"
     echo "  NOTE: restart Hermes for the updated code to load."
   else
-    LIVE_SKIP_REASON="fast-forward not possible"
-    echo "  SKIP: live checkout cannot fast-forward (local commits on this host?)."
+    [ -n "$FF_ERR" ] && printf '%s\n' "$FF_ERR" | sed 's/^/    git: /'
+    LIVE_SKIP_REASON="fast-forward failed (see git output above)"
     echo "  Manual: cd $HERMES_DIR && git fetch fork customizations && git merge --ff-only fork/customizations"
   fi
 fi
