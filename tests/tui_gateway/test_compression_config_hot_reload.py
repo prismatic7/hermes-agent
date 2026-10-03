@@ -7,6 +7,7 @@ the already-open session kept the computed threshold from agent creation.
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 from agent.context_compressor import ContextCompressor
@@ -326,3 +327,66 @@ def test_apply_live_compression_config_is_self_contained():
     _apply_live_compression_config(agent, {"compression": {"enabled": True}})
     assert agent.compression_enabled is True
     assert agent.codex_responses_native_compaction is False
+
+
+class _ExternalEngine:
+    """Stand-in for a plugin context engine (e.g. hermes-lcm): satisfies the ContextEngine ABC
+    surface the host reads here and defines NONE of the ContextCompressor-only attributes."""
+
+    context_length = 1_048_576
+    threshold_percent = 0.55
+    threshold_tokens = 576_716
+
+    def update_model(self, **_kwargs):
+        return None
+
+
+def test_external_engine_sync_does_not_raise_or_warn(monkeypatch, caplog):
+    """Regression: adopting live compression config on an external engine raised
+    AttributeError on ``_coerce_threshold_tokens_cap`` (a ContextCompressor-only
+    method), and the caller's broad except logged 'Could not apply live compression
+    config' and aborted the rest of the sync. The compressor-only writes must be
+    skipped, not attempted."""
+    agent = SimpleNamespace(
+        model="unset-test-model",
+        provider="",
+        base_url="",
+        context_compressor=_ExternalEngine(),
+        compression_enabled=True,
+        compression_idle_compact_after_seconds=0,
+        codex_responses_native_compaction=False,
+        codex_responses_compact_threshold=200_000,
+    )
+    session = {"agent": agent, "session_key": "session-external"}
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"compression": {"threshold_tokens": 100_000}})
+
+    with caplog.at_level(logging.WARNING):
+        server._sync_agent_compression_with_config("sid-external", session)
+
+    assert "Could not apply live compression config" not in caplog.text
+    # The guard must not invent compressor-only attributes on the external engine.
+    assert not hasattr(agent.context_compressor, "threshold_tokens_cap")
+    assert not hasattr(agent.context_compressor, "tail_mode")
+
+
+def test_external_engine_still_receives_context_length_pin(monkeypatch):
+    """The engine-agnostic context-length pin must survive the guard: a plugin engine
+    still has to see a configured ``model.context_length``, or it keeps a stale window
+    while every display surface reports the pin."""
+    engine = _ExternalEngine()
+    agent = SimpleNamespace(
+        model="unset-test-model",
+        provider="",
+        base_url="",
+        context_compressor=engine,
+        compression_enabled=True,
+        compression_idle_compact_after_seconds=0,
+        codex_responses_native_compaction=False,
+        codex_responses_compact_threshold=200_000,
+    )
+    session = {"agent": agent, "session_key": "session-external-pin"}
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"model": {"context_length": 300_000}, "compression": {}})
+
+    server._sync_agent_compression_with_config("sid-external-pin", session)
+
+    assert engine.context_length == 300_000
