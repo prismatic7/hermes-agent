@@ -280,19 +280,40 @@ finish() {
   exit "$rc"
 }
 
-push_fork() {  # push_fork <refspec> <label> — plain (non-forcing) push that
-               # tolerates a same-content race: if another host pushed the
-               # IDENTICAL content first, we are rejected because the remote
-               # moved — accept it and continue rather than failing. Leader-only
-               # in practice (followers never push), kept as a safety net for a
-               # hand-run leader on a second host.
+push_fork() {  # push_fork <refspec> <label> [mirror]
+               # Two kinds of destination, two different rules:
                #
-               # Deliberately NOT --force-with-lease: the merge workflow never
-               # rewrites fork history, so a force push would only ever discard
-               # commits. A rejection here means something genuinely needs a
-               # human, never a routine nightly rebase rewrite.
-  local refspec="$1" label="$2"
-  if git -C "$SCRATCH_CLONE" push --quiet fork "$refspec" 2>&1; then
+               #   fork/main  — a MIRROR of upstream. Its entire purpose is to
+               #     equal origin/main, so it is BY DESIGN rewritten every run.
+               #     A plain push cannot move it backwards, so the moment
+               #     anything lands on fork/main that upstream lacks (a hand-made
+               #     commit, a merge from the GitHub UI) the nightly sync dies and
+               #     stays dead until a human looks. Measured 2026-10-04: exactly
+               #     that — one direct commit to fork/main wedged the job for days.
+               #     => --force-with-lease, which is safe here: it refuses if the
+               #     remote moved for a reason we did not see, and otherwise makes
+               #     the mirror exact. The mirror is the one ref where a force is
+               #     the CORRECT operation, not a risk.
+               #
+               #   fork/customizations — the merge result. This one is never
+               #     rewritten, so a plain push is right. A rejection means either
+               #     a benign same-content race (tolerated below) or something
+               #     genuinely needing a human — never a routine rewrite.
+  local refspec="$1" label="$2" mode="${3:-}"
+  if [ "$mode" = "mirror" ]; then
+    local branch expect
+    branch="${refspec##*:}"
+    expect="$(git -C "$SCRATCH_CLONE" rev-parse --verify --quiet "refs/remotes/fork/$branch" 2>/dev/null || true)"
+    if [ -n "$expect" ]; then
+      if git -C "$SCRATCH_CLONE" push --quiet --force-with-lease="$branch:$expect" fork "$refspec" 2>&1; then
+        echo "  $label <- mirrored onto origin/main's tip (force-with-lease from $expect)"
+        return 0
+      fi
+    elif git -C "$SCRATCH_CLONE" push --quiet fork "$refspec" 2>&1; then
+      echo "  $label <- pushed (no prior remote ref)"
+      return 0
+    fi
+  elif git -C "$SCRATCH_CLONE" push --quiet fork "$refspec" 2>&1; then
     echo "  $label <- pushed"
     return 0
   fi
@@ -635,10 +656,10 @@ echo ""
 echo "Syncing fork ..."
 if $DRY_RUN; then
   echo "  [DRY RUN] would push:"
-  echo "    - main            -> fork/main            (force, tracks upstream)"
+  echo "    - main            -> fork/main            (force-with-lease mirror of upstream)"
   echo "    - customizations  -> fork/customizations  (merge result)"
 else
-  push_fork "origin/main:main" "fork/main"
+  push_fork "origin/main:main" "fork/main" mirror
   echo "  fork/main <- origin/main ($(git -C "$SCRATCH_CLONE" rev-parse --short origin/main))"
   push_fork "HEAD:customizations" "fork/customizations"
   echo "  fork/customizations <- merged ($(git -C "$SCRATCH_CLONE" rev-parse --short HEAD))"
