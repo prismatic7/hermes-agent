@@ -245,6 +245,14 @@ def _claim_for_manual_run(job_id: str, log_label: str):
         claimed_job = claim_job_for_fire(job_id, manual=True, return_job=True)
         if isinstance(claimed_job, dict):
             return claimed_job, None
+        from cron.wake_budget import BUDGET_EXCEEDED
+        if claimed_job is BUDGET_EXCEEDED:
+            return None, {
+                "claimed": False, "success": False,
+                "error": ("Daily wake budget exhausted (cron.max_wakes_per_day ×2 for an "
+                          "explicit run); not run. Raise cron.max_wakes_per_day or use "
+                          "`hermes cron run` again tomorrow."),
+            }
         refreshed = get_job(job_id)
         if refreshed is None:
             reason = "Job no longer exists; nothing to run."

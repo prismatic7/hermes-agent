@@ -4282,8 +4282,11 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     # Claim only when the worker actually starts, so a queued lease can't expire first.
     claimed = claim_job_for_fire(job["id"], return_job=True)
     if not claimed:
-        finish_execution(
-            job["execution_id"], success=False, error="Fire claim lost; execution was not started.")
+        from cron.wake_budget import BUDGET_EXCEEDED
+        reason = ("Daily wake budget exhausted; automatic wake refused."
+                  if claimed is BUDGET_EXCEEDED
+                  else "Fire claim lost; execution was not started.")
+        finish_execution(job["execution_id"], success=False, error=reason)
         return True
     # CAS returns the persisted record; bool fallback only for older test doubles.
     claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)

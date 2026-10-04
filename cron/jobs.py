@@ -2798,6 +2798,15 @@ def claim_job_for_fire(
                     job["next_run_at"] = nxt
                     save_jobs(jobs)
             return False
+        # Daily wake budget (Lotti ADR 0112): consumed at the one choke point every fire
+        # reaches, AFTER every other lose-condition above — a claim refused for another
+        # reason must not burn a wake, and an already-completed occurrence must not either.
+        # Off by default; when off, allow_wake() reads and writes nothing and scheduling is
+        # unchanged. ``explicit`` = the fire is user-issued (run-now / force) and may exceed
+        # the limit up to 2x.
+        from cron.wake_budget import BUDGET_EXCEEDED, allow_wake
+        if not allow_wake(explicit=bool(force or manual)):
+            return BUDGET_EXCEEDED
         if force:
             _activate_job_record(job)
         # Per-acquisition token: a process may legitimately reclaim its own stale lease, and the

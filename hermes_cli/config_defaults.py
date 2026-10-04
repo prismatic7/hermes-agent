@@ -1886,6 +1886,17 @@ DEFAULT_CONFIG = {
         # silences a signature for good. 0 = re-alert on every failing run. Keep in sync with
         # cron.scheduler.DEFAULT_FAILURE_REPEAT_ALERT_HOURS.
         "failure_repeat_alert_hours": 6,
+        # Daily wake budget (Lotti ADR 0112, adapted). False = OFF: no counter is read,
+        # nothing is written, and scheduling is byte-identical (the default). True = cron
+        # enforces a per-day ceiling on fires at the single choke point
+        # (cron.jobs.claim_job_for_fire). Automatic wakes stop at max_wakes_per_day; an
+        # explicit `hermes cron run` may exceed it up to 2x, bounding a request mislabelled
+        # as the user's. An unreadable policy fails closed for automatic work and open for
+        # an explicit request. See cron/wake_budget.py.
+        "enforce_wake_budget": False,
+        # Ceiling enforced by enforce_wake_budget, CLAMPED to [1, 24] so a peer config cannot
+        # lift it arbitrarily. 0 or unparseable falls back to the default (10).
+        "max_wakes_per_day": 10,
     },
     # Kanban multi-agent coordination. The dispatcher ticks every N seconds, reclaims stale claims,
     # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per
