@@ -34,7 +34,13 @@ import sys
 import tempfile
 from pathlib import Path
 
-import pytest
+try:
+    import pytest
+except ImportError:  # the __main__ path below runs without pytest installed
+    class _NoPytest:
+        def fixture(self, *args, **kwargs):
+            return args[0] if args else (lambda fn: fn)
+    pytest = _NoPytest()
 
 VICTIM = "HERMES_WRITE_SAFE_ROOT"
 REPO_ROOT = Path(__file__).resolve().parents[2]
