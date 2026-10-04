@@ -423,6 +423,31 @@ def test_fire_due_lost_claim_does_not_run(monkeypatch):
     assert ran == []
 
 
+def test_claim_fire_reports_budget_refusal_distinctly(monkeypatch):
+    """A daily-budget refusal reaches claim_fire as BUDGET_EXCEEDED (a falsy str); it must be
+    reported as a budget message, NOT the generic lost-claim one. Both paths still return None."""
+    import cron.executions as executions
+    import cron.jobs as jobs
+    from cron import wake_budget
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    errors = []
+    monkeypatch.setattr(executions, "create_execution",
+                        lambda jid, **kw: {"id": "e1"})
+    monkeypatch.setattr(executions, "finish_execution",
+                        lambda eid, **kw: errors.append(kw["error"]))
+    monkeypatch.setattr(jobs, "claim_job_for_fire",
+                        lambda jid, **kw: wake_budget.BUDGET_EXCEEDED)
+
+    assert InProcessCronScheduler().claim_fire("j1") is None
+    assert "budget" in errors[-1].lower(), errors
+
+    # A genuine lost claim keeps the generic wording.
+    monkeypatch.setattr(jobs, "claim_job_for_fire", lambda jid, **kw: False)
+    assert InProcessCronScheduler().claim_fire("j1") is None
+    assert errors[-1] == "Fire claim was not acquired"
+
+
 
 
 # ── F2a: ticker liveness — survival, heartbeat, honest status (#32612, #32895) ──

@@ -2749,7 +2749,7 @@ def _machine_id() -> str:
 def claim_job_for_fire(
     job_id: str, *, claim_ttl_seconds: int = FIRE_CLAIM_TTL_SECONDS, force: bool = False,
     manual: bool = False, return_job: bool = False,
-) -> Union[bool, Dict[str, Any]]:
+) -> Union[bool, str, Dict[str, Any]]:
     """Atomically claim a job for one external 'fire' (multi-machine at-most-once); True iff THIS
     caller won (``CronScheduler.fire_due``: exactly one of N replicas runs a job). Under the
     fence + file lock: reject missing/terminal/paused jobs unless ``force`` (explicit manual
@@ -2758,7 +2758,14 @@ def claim_job_for_fire(
     resume: no occurrence stamp, so the still-pending ``next_run_at`` slot is not skipped. Lose if a claim younger than
     ``claim_ttl_seconds`` exists (the TTL lets another fire reclaim after a crash; mark_job_run
     clears the claim). Otherwise stamp ``fire_claim`` and, for recurring jobs, advance
-    ``next_run_at`` so a stale re-delivery cannot re-fire."""
+    ``next_run_at`` so a stale re-delivery cannot re-fire.
+
+    Return contract: ``True``/``False`` (or the claimed job dict when ``return_job``) for the
+    ordinary outcomes, and ``cron.wake_budget.BUDGET_EXCEEDED`` when the daily wake budget refused
+    an otherwise-valid fire. That sentinel is the falsy ``""`` BY DESIGN — every existing caller
+    treats the result truthily (``if not claimed`` / ``isinstance(claimed, dict)``) and a truthy
+    sentinel would break them. Tests that need to tell a budget refusal apart from a lost claim
+    must compare by identity (``claimed is BUDGET_EXCEEDED``), never by truthiness."""
     def apply(jobs, _i, job):
         if is_terminal_job(job) and not _is_recoverable_error_job(job):
             return False

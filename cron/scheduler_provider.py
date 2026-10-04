@@ -220,7 +220,11 @@ class CronScheduler(ABC):
             )
             raise
         if not isinstance(claimed_job, dict):
-            finish_execution(execution["id"], success=False, error="Fire claim was not acquired")
+            from cron.wake_budget import BUDGET_EXCEEDED
+            reason = ("Daily wake budget exhausted; automatic wake refused."
+                      if claimed_job is BUDGET_EXCEEDED
+                      else "Fire claim was not acquired")
+            finish_execution(execution["id"], success=False, error=reason)
             return None
         claimed_job["execution_id"] = execution["id"]
         return claimed_job
