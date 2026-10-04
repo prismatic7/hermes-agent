@@ -332,6 +332,53 @@ push_fork() {  # push_fork <refspec> <label> [mirror]
   fail "push to $label rejected and remote differs — resolve manually"
 }
 
+# merge_upstream — merge origin/main into the scratch clone, classifying the
+# failure honestly. Sets MERGE_ERR and CONFLICTED on failure; returns 1.
+#
+# Why this is a function and not an inline `if`: the old inline version had
+# three bugs that together produced a FALSE "merge conflict" report — the same
+# family as the ff-only and plugin-update failures (an invented reason over a
+# path nobody checked):
+#
+#   1. `CONFLICTED` was read AFTER `merge --abort`. Abort clears the unmerged
+#      index entries, so the list was ALWAYS empty — the message could never
+#      name a file, even for a genuine conflict.
+#   2. Only `unable to read sha1 file` was treated as an infrastructure fault.
+#      A partial clone also fails as `did not send all necessary objects` or
+#      `bad tree object`, and both fell through to "merge conflict".
+#   3. A stale `index.lock` makes the merge die with `fatal: Unable to write
+#      index` (measured: rc=128). That is recoverable, not a human problem, and
+#      it was also reported as a conflict. Now: clear it and retry once.
+#
+# Rule: never discard a failure's evidence, and never name a cause the code did
+# not verify.
+merge_upstream() {
+  MERGE_ERR=""
+  CONFLICTED=""
+  local err
+  if err="$(git -C "$SCRATCH_CLONE" merge --no-edit --quiet origin/main 2>&1)"; then
+    return 0
+  fi
+  # Stale lock in the scratch clone — recoverable, retry once.
+  case "$err" in
+    *"Unable to create"*"index.lock"*|*"Unable to write index"*)
+      echo "  merge hit a stale index.lock in the scratch clone — clearing and retrying once"
+      rm -f "$SCRATCH_CLONE/.git/index.lock"
+      git -C "$SCRATCH_CLONE" merge --abort 2>/dev/null || true
+      if err="$(git -C "$SCRATCH_CLONE" merge --no-edit --quiet origin/main 2>&1)"; then
+        echo "  retry succeeded"
+        return 0
+      fi
+      ;;
+  esac
+  MERGE_ERR="$err"
+  # Read the conflict list BEFORE aborting — abort clears it (bug 1).
+  CONFLICTED="$(git -C "$SCRATCH_CLONE" diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ' ')"
+  # Leave the scratch clone clean; never push a half-merged tree.
+  git -C "$SCRATCH_CLONE" merge --abort 2>/dev/null || true
+  return 1
+}
+
 # ── 1. Pre-flight: live checkout exists, is clean, and is on customizations ──
 [ -d "$HERMES_DIR/.git" ] || fail "$HERMES_DIR is not a git repository"
 LIVE_BRANCH="$(git -C "$HERMES_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
@@ -593,28 +640,24 @@ fi
 if $DRY_RUN; then
   echo "  [DRY RUN] would merge origin/main into customizations"
 else
-  # Merge upstream in. `--no-edit` keeps the default merge message so the
-  # history records exactly when and what was reconciled.
-  if ! git -C "$SCRATCH_CLONE" merge --no-edit --quiet origin/main 2>"$SCRATCH_CLONE.merge.err"; then
-    # Distinguish a REAL content conflict from a broken object store BEFORE
-    # aborting: `git diff --diff-filter=U` is empty in both cases, so the old
-    # message blamed a conflict that does not exist and sent a human hunting for
-    # one (2026-09-26 sma). An unreadable object is an infrastructure fault, and
-    # the remedy is a re-clone, not a manual resolution.
-    MERGE_ERR="$(cat "$SCRATCH_CLONE.merge.err" 2>/dev/null || true)"
-    UNREAD="$(printf '%s\n' "$MERGE_ERR" | grep -c 'unable to read sha1 file' || true)"
-    # A conflicting merge is a real divergence needing a human decision. Abort
-    # so the scratch clone is left clean and the fork untouched — never push a
-    # half-merged tree.
-    git -C "$SCRATCH_CLONE" merge --abort 2>/dev/null || true
-    rm -f "$SCRATCH_CLONE.merge.err"
-    if [ "${UNREAD:-0}" -gt 0 ]; then
-      fail "scratch clone is missing $UNREAD object(s) from a partial-clone source — the merge is UNVERIFIED, not conflicting. Re-run; if it repeats, re-clone the live checkout."
+  if ! merge_upstream; then
+    # Classify from MERGE_ERR, which merge_upstream captured. The previous
+    # version deleted its error file before building this message, so git's real
+    # reason was destroyed exactly when it was needed: on 2026-10-05 the job
+    # reported "merge conflict" and re-reading the log could not show why,
+    # because the evidence had already been unlinked.
+    case "$MERGE_ERR" in
+      *"unable to read sha1 file"*|*"did not send all necessary objects"*|*"bad tree object"*)
+        fail "scratch clone could not READ upstream objects (partial-clone source) — the merge is UNVERIFIED, not conflicting, so do not go looking for a conflict. Re-run; if it repeats, re-clone the live checkout. git said: $(printf '%s' "$MERGE_ERR" | tr '\n' ' ' | cut -c1-240)"
+        ;;
+    esac
+    if [ -z "$CONFLICTED" ]; then
+      # No unmerged entries => NOT a content conflict. Say what actually
+      # happened instead of naming a cause the code never verified.
+      fail "merge of upstream $(git -C "$SCRATCH_CLONE" rev-parse --short origin/main) failed, but NO files are in conflict — this is not a content conflict. git said: $(printf '%s' "$MERGE_ERR" | tr '\n' ' ' | cut -c1-240)"
     fi
-    CONFLICTED="$(git -C "$SCRATCH_CLONE" diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ' ')"
-    fail "merge conflict with upstream $(git -C "$SCRATCH_CLONE" rev-parse --short origin/main)${CONFLICTED:+ on: $CONFLICTED} — resolve manually, then re-run"
+    fail "merge conflict with upstream $(git -C "$SCRATCH_CLONE" rev-parse --short origin/main) on: ${CONFLICTED} — resolve manually, then re-run"
   fi
-  rm -f "$SCRATCH_CLONE.merge.err"
   echo "  merged -> $(git -C "$SCRATCH_CLONE" rev-parse --short HEAD)"
   # A merge resolves each conflict once, but a clean-looking result can still
   # DISCARD our side of a file. That is how `56dc2b79bb`'s members_stamp guard
@@ -640,21 +683,30 @@ fi
 
 NEW_CUSTOM_SHA="$(git -C "$SCRATCH_CLONE" rev-parse HEAD)"
 
-# Nothing to do when upstream is already merged into the carried set and the
+# Nothing to push when upstream is already merged into the carried set and the
 # branch is unchanged. (With a merge workflow, "up to date" means upstream is
 # already an ancestor — not that the two SHAs are equal.)
+#
+# NOTE: this only SKIPS the push. It deliberately does NOT finish/exit here.
+# It used to, and that stranded the live checkout: on 2026-10-05 the checkout sat
+# 297 commits behind a fork that was already current, and the job reported a
+# cheerful "no-op" every night while the running code stayed stale — because the
+# exit preceded the live-checkout update in section 6. An early exit must never
+# skip a step that has nothing to do with what was skipped.
+NO_PUSH=false
 if git -C "$SCRATCH_CLONE" merge-base --is-ancestor origin/main customizations 2>/dev/null \
    && [ "$FORK_CUSTOM_SHA" = "$NEW_CUSTOM_SHA" ]; then
+  NO_PUSH=true
   echo ""
-  echo "Already up to date (no upstream changes, carried set unchanged)."
-  echo "=== done (no update needed) ==="
-  finish "fork-sync[$HOST_LABEL/$ROLE] no-op: upstream and customizations unchanged at $(git -C "$SCRATCH_CLONE" rev-parse --short "$NEW_CUSTOM_SHA")"
+  echo "Already up to date (no upstream changes, carried set unchanged) — push skipped."
 fi
 
 # ── 5. Update fork main + push customizations ──
 echo ""
 echo "Syncing fork ..."
-if $DRY_RUN; then
+if $NO_PUSH; then
+  echo "  skipped — nothing new to push."
+elif $DRY_RUN; then
   echo "  [DRY RUN] would push:"
   echo "    - main            -> fork/main            (force-with-lease mirror of upstream)"
   echo "    - customizations  -> fork/customizations  (merge result)"
@@ -724,10 +776,16 @@ if ! $DRY_RUN; then
   rm -rf "$SCRATCH_CLONE"
 fi
 
+# The summary must not call a run a "no-op" when it moved the live checkout —
+# that wording is what made a stranded checkout look healthy (2026-10-05).
 if $DRY_RUN; then
   finish "fork-sync[$HOST_LABEL/$ROLE] DRY RUN: would push customizations $NEW_SHORT onto upstream $UP_SHORT (carried: $CARRIED)"
 elif [ -n "$LIVE_SKIP_REASON" ]; then
   finish "fork-sync[$HOST_LABEL/$ROLE] ok (fork pushed): upstream $UP_SHORT -> customizations $NEW_SHORT (carried: $CARRIED); live checkout NOT updated ($LIVE_SKIP_REASON)"
+elif $LIVE_CHANGED; then
+  finish "fork-sync[$HOST_LABEL/$ROLE] ok: upstream $UP_SHORT -> customizations $NEW_SHORT (carried: $CARRIED); live checkout advanced"
+elif $NO_PUSH; then
+  finish "fork-sync[$HOST_LABEL/$ROLE] no-op: upstream and customizations unchanged at $NEW_SHORT; live checkout already current"
 else
   finish "fork-sync[$HOST_LABEL/$ROLE] ok: upstream $UP_SHORT -> customizations $NEW_SHORT (carried: $CARRIED)"
 fi
