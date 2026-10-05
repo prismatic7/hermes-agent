@@ -40,6 +40,17 @@ def main() -> int:
         return 0  # not a merge commit; nothing to compare
     ours, upstream = parents[1].decode(), parents[2].decode()
 
+    # The LAST SYNC POINT. A line that already existed here arrived FROM upstream
+    # and we merely carried it; only lines added after this point are OUR customs.
+    # Without this filter the check reports upstream's OWN edits as "our loss":
+    # anything upstream wrote, we carried, and upstream then reworded is present
+    # in `mine`, absent from the reworded result, and absent from the new upstream
+    # tip — the exact signature of a loss, for a line that was never ours.
+    # Measured 2026-10-06: 4 files flagged, all 4 upstream's own churn (e.g. a
+    # config_defaults.py comment authored by an upstream contributor), none ours.
+    # A warning that cries wolf on every sync is how a REAL loss gets skimmed past.
+    base = git("merge-base", ours, upstream).stdout.strip().decode()
+
     names = git("log", "--no-merges", "--name-only", "--format=", "HEAD", "--not", upstream)
     files = sorted({l.strip() for l in names.stdout.decode().splitlines() if l.strip()})
 
@@ -55,12 +66,14 @@ def main() -> int:
         mine, theirs = blob(ours, path), blob(upstream, path)
         if mine is None or mine == merged:
             continue
-        # Lines we added relative to our side, still absent from the result and
+        # Lines WE added SINCE the last sync, still absent from the result and
         # never supplied by upstream. That combination means ours is gone.
+        base_lines = set((blob(base, path) or b"").splitlines())
         upstream_lines = set(theirs.splitlines()) if theirs else set()
         merged_lines = set(merged.splitlines())
         gone = [l for l in mine.splitlines()
-                if l.strip() and l not in merged_lines and l not in upstream_lines]
+                if l.strip() and l not in base_lines
+                and l not in merged_lines and l not in upstream_lines]
         if gone:
             losses.append((path, len(gone)))
 

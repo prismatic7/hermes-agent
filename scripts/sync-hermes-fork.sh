@@ -772,8 +772,19 @@ NEW_SHORT="$(git -C "$SCRATCH_CLONE" rev-parse --short HEAD)"
 # Clean up the scratch clone before the terminal reconcile: it is no longer
 # needed, and a reconcile failure must not leave it behind for the next run to
 # trip over. (Dry-run keeps it for inspection.)
+#
+# Cleanup must NEVER be fatal. This script runs `set -eo pipefail`, and an
+# unguarded `rm -rf` here means a transient filesystem failure on a ~27 GB tree
+# aborts the run AFTER everything has been merged and pushed — producing empty
+# stdout, rc=1, and no summary at all, because the abort skips finish(). That
+# is exactly what happened on 2026-10-06: every step succeeded and was pushed,
+# then `rm: ... : Directory not empty` killed the job and the alert said only
+# "sync failed (rc=1)". A failed cleanup is harmless — the next run clears the
+# directory at startup (with its own retry) — so report it and carry on.
 if ! $DRY_RUN; then
-  rm -rf "$SCRATCH_CLONE"
+  if ! rm -rf "$SCRATCH_CLONE" 2>/dev/null; then
+    echo "  (scratch clone cleanup failed — harmless; the next run clears it)"
+  fi
 fi
 
 # The summary must not call a run a "no-op" when it moved the live checkout —
