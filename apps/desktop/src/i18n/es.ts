@@ -870,6 +870,15 @@ export const esOverrides = {
     resetConfirm: '¿Restablecer toda la configuración a los valores predeterminados de Hermes?',
     exportFailed: 'Falló la exportación',
     resetFailed: 'Falló el restablecimiento',
+    pluginPages: {
+      blurb:
+        'Opciones que añaden los plugins instalados. Cada plugin tiene su propia página y algunos añaden subpáginas.',
+      empty: 'Ningún plugin tiene ajustes todavía.',
+      manage: 'Gestionar plugins',
+      agentSettings: 'Ajustes del agente',
+      pageCount: (n: number) => (n === 1 ? '1 página' : `${n} páginas`),
+      missing: 'Este plugin no tiene página de ajustes. Puede que esté desactivado o desinstalado.'
+    },
     nav: {
       providers: 'Proveedores',
       providerAccounts: 'Cuentas',
@@ -891,24 +900,15 @@ export const esOverrides = {
     },
     plugins: {
       title: 'Plugins de escritorio',
-      blurb:
-        'Amplía esta app, no un agente: se instala una sola vez para toda la app, sea cual sea el perfil, gateway o equipo al que te conectes. Incluidos o copiados en la carpeta desktop-plugins; los interruptores se aplican al instante.',
-      count: n => `${n} instalados`,
       openFolder: 'Abrir la carpeta de plugins de escritorio',
       rescan: 'Volver a buscar',
       reveal: 'Mostrar en el gestor de archivos',
-      enable: 'Activar',
-      disable: 'Desactivar',
       failed: 'falló',
-      empty: 'Aún no hay plugins de escritorio instalados.',
       kinds: {
         bundled: 'incluido',
         disk: 'en disco',
         runtime: 'en ejecución'
       },
-      agentHalfMissing: 'falta la parte del agente aquí',
-      agentHalfMissingTip:
-        'Esta es la parte de escritorio de un plugin incluido, pero su parte del agente no está instalada en el backend o perfil conectado. Instálala desde Capacidades → Plugins.',
       installModal: {
         installFromGit: 'Instalar desde Git',
         reviewRepository: 'Revisar repositorio',
@@ -2009,6 +2009,8 @@ export const esOverrides = {
         'Plataforma remota no compatible. El modo SSH de Hermes Desktop admite hosts remotos Linux, macOS y Windows.',
       sshErrTimeout: 'La conexión SSH agotó el tiempo de espera. Es posible que el host no responda o esté en reposo.',
       sshErrUpdateRequired: 'Actualiza Hermes en el host remoto antes de conectarte con Desktop SSH.',
+      sshErrInteractiveAuth:
+        'Tailscale SSH requiere una comprobación interactiva del navegador. Ejecuta `ssh <host> true` en la terminal, completa la comprobación y vuelve a intentarlo; Hermes ejecuta SSH de forma no interactiva.',
       sshErrUnknown: 'Falló la conexión SSH.'
     },
     keys: {
@@ -2906,7 +2908,7 @@ export const esOverrides = {
         save: 'Guardar configuración',
         saved: (name: string) => `Configuración de ${name} guardada.`,
         saveFailed: (name: string) => `No se pudo guardar la configuración de ${name}`,
-        optional: '(opcional)',
+        required: 'Obligatorio',
         secretSet: '•••••••• (configurado)',
         secretStoredAs: (env: string) =>
           `Se guarda en el .env del perfil como ${env}, nunca en config.yaml; déjalo en blanco para conservar el valor actual.`
