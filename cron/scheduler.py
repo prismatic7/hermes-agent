@@ -36,7 +36,7 @@ from typing import Any, Callable, Dict, List, Optional, Protocol, Union
 # `hermes update`) otherwise fail with ModuleNotFoundError for hermes_time et al.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from cron.worker_bootstrap import WORKER_MARKER
+from cron.worker_bootstrap import WORKER_MARKER, finish_worker_boot
 from hermes_constants import get_hermes_home, hermes_home_key
 from hermes_cli.observability.shared_metrics_gateway import note_cron_execution, note_cron_skipped
 from cron.env_settings import cron_env_setting
@@ -53,21 +53,6 @@ from agent.session_activity import AwakeIdleMeter
 from agent.turn_failure_copy import is_max_iteration_handoff
 
 logger = logging.getLogger(__name__)
-
-
-def _close_late_session_db_result(future: "concurrent.futures.Future") -> None:
-    """Done-callback: close a SessionDB whose constructor finished after run_job's init timeout
-    (worker abandoned via ``shutdown(wait=False)``), else its .db/WAL/SHM handles leak to EMFILE.
-
-    If the constructor later completes inside that abandoned worker, the Future's result — an open SessionDB
-    holding .db / WAL / SHM file handles — would be orphaned and never closed, leaking descriptors until
-    EMFILE (#72782). This callback retrieves and closes that eventual late result.
-    """
-    with contextlib.suppress(Exception):
-        db = future.result()
-        if db is not None:
-            from hermes_state_registry import release_or_close
-            release_or_close(db)
 
 
 def _set_cron_session_title(session_db, session_id, base_title):
@@ -230,11 +215,6 @@ def stale_code_yield_labels(recorded_error: str | None) -> tuple[str, str] | Non
     return (match.group(1), match.group(2)) if match else None
 
 
-# Log the yield at most once per episode (reset when the skew changes) to avoid per-interval spam.
-_YIELD_LOG_INTERVAL_SECONDS = 3600.0
-_last_yield_log: dict[str, object] = {}
-
-
 def _should_yield_tick_to_fresh_gateway() -> tuple[str, str] | None:
     """``(boot_rev, disk_rev)`` when THIS profile's tick must yield to a fresher gateway, else None.
 
@@ -271,21 +251,6 @@ def _should_yield_tick_to_fresh_gateway() -> tuple[str, str] | None:
     except Exception:
         return None
     return skew
-
-
-def _log_tick_yield_once(reason: str) -> None:
-    """Log the yield at error level once per episode (skew signature)."""
-    global _last_yield_log
-    now = time.monotonic()
-    last_reason = _last_yield_log.get("reason")
-    last_at = _last_yield_log.get("at", 0.0)
-    if last_reason != reason or (now - float(last_at)) >= _YIELD_LOG_INTERVAL_SECONDS:
-        logger.error(
-            "Cron tick yielded: this process is running stale code (%s) and a "
-            "fresher gateway owns the runtime lock — jobs will fire from that "
-            "process. Restart this one to reclaim its ticks.",
-            reason)
-    _last_yield_log = {"reason": reason, "at": now}
 
 
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
@@ -549,11 +514,12 @@ from cron.jobs import (
     _ensure_cron_dir, advance_next_runs, claim_dispatch, claim_job_for_fire, fire_claim_fence,
     clear_run_claim, get_due_jobs, heartbeat_fire_claim, heartbeat_run_claim, mark_job_run,
     save_job_output, self_removal_delivery_allowed, self_removal_delivery_scope, use_cron_store)
+from cron import store_health
 from cron.execution_identity import enter_cron_execution, exit_cron_execution
 from cron.executions import (
     _TERMINAL_STATES, HANDOFF_ADOPTION_GRACE_SECONDS, create_execution, finish_execution,
     get_execution, mark_execution_handoff_pending, mark_execution_running,
-    recover_interrupted_executions, terminalize_dead_owner)
+    recover_interrupted_executions, settle_unstarted_execution, terminalize_dead_owner)
 
 # Response marker that suppresses delivery (output is still saved locally for audit).
 SILENT_MARKER = "[SILENT]"
@@ -1949,6 +1915,7 @@ def _open_cron_session_db(job: dict):
             # inside it, the future's result would be orphaned and its SQLite FDs (.db, WAL, SHM) leak until
             # process exit. Register a done-callback that retrieves and closes any eventual late result
             # (#72782).
+            from cron.scheduler_detached_worker import _close_late_session_db_result
             _session_db_future.add_done_callback(_close_late_session_db_result)
             raise
         finally:
@@ -2181,7 +2148,8 @@ def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgen
     return final_response
 
 
-def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_session_id: str) -> None:
+def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_session_id: str,
+                           workdir: Optional[str] = None) -> None:
     """Title, classify, end and release the cron session after the agent turn has returned."""
     # Bound every DB op so storage failure cannot hold the dispatch guard.
     _session_db = _BoundedCronSessionDB(session_db, job_id)
@@ -2251,6 +2219,13 @@ def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_s
                 job_id, _lifecycle, _end_reason)
     except (Exception, KeyboardInterrupt) as e:
         logger.debug("Job '%s': session lifecycle classification failed: %s", job_id, e)
+    # Stamp the job's workdir on the row BEFORE end_session (title-write ordering, #50536): the
+    # sidebar groups by cwd prefix and nothing else writes a cron row's cwd (#108205).
+    if workdir:
+        try:
+            _session_db.update_session_cwd(_final_cron_session_id, workdir)
+        except (Exception, KeyboardInterrupt) as e:
+            logger.debug("Job '%s': failed to stamp workdir on session row: %s", job_id, e, exc_info=True)
     try:
         _session_db.end_session(_final_cron_session_id, _end_reason)
         # The scheduler owns cron-session finalization. AIAgent.close() also
@@ -2704,10 +2679,12 @@ def run_job(
     finally:
         from cron.scheduler_detached_worker import defer_teardown_to_running_worker
         _worker_teardown_deferred = defer_teardown_to_running_worker(
-            _worker_state.get("future"), _session_db, agent, job_id, job_name, _cron_session_id)
+            _worker_state.get("future"), _session_db, agent, job_id, job_name, _cron_session_id,
+            workdir=scope.workdir)
         scope.exit()
         if _session_db and not _worker_teardown_deferred:
-            _finalize_cron_session(_session_db, agent, job_id, job_name, _cron_session_id)
+            _finalize_cron_session(_session_db, agent, job_id, job_name, _cron_session_id,
+                                   workdir=scope.workdir)
         # Tear down the ephemeral agent or the gateway leaks fds per tick (EMFILE). With deferred
         # teardown, hand the live agent back: delivery needs a live async client.
         # Release subprocesses, terminal sandboxes, browser daemons, and the main OpenAI/httpx client held
@@ -4211,7 +4188,7 @@ def _acquire_tick_lock(lock_file):
                 "Cron tick could not acquire tick lock: %s — scheduler will "
                 "attempt fd reclamation and retry with backoff",
                 exc)
-        else:
+        elif exc.errno not in store_health.UNWRITABLE_ERRNOS:  # those degrade the store (tick caller)
             logger.error("Cron tick could not acquire tick lock: %s", exc)
         raise
 
@@ -4307,7 +4284,17 @@ def _sweep_mcp_orphans() -> None:
 def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     """Run one due job via the shared ``run_one_job`` body."""
     # Claim only when the worker actually starts, so a queued lease can't expire first.
-    claimed = claim_job_for_fire(job["id"], return_job=True)
+    try:
+        claimed = claim_job_for_fire(job["id"], return_job=True)
+    except OSError as exc:
+        store_health.note_unwritable(exc, f"skipped job '{job.get('name') or job['id']}'", "claim", [job])
+        settle_unstarted_execution(
+            job["execution_id"], job["id"], f"Cron store unwritable; not started: {exc}")
+        return False
+    except BaseException as exc:  # settle first, then surface the real error
+        settle_unstarted_execution(
+            job["execution_id"], job["id"], f"Fire claim failed: {type(exc).__name__}: {exc}")
+        raise
     if not claimed:
         from cron.wake_budget import BUDGET_EXCEEDED
         reason = ("Daily wake budget exhausted; automatic wake refused."
@@ -4376,6 +4363,7 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
     # discard the LAUNCH home's key and leak every secondary profile's claim.
     _claim_home = _get_hermes_home()
     # Record the attempt before dispatch; recovery marks abandoned rows unknown (no retry).
+    execution = None
     try:
         execution = create_execution(
             job_id, source="builtin", scheduled_instant=job.get("_scheduled_instant"))
@@ -4386,8 +4374,12 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
         # Release the claim so the next tick retries instead of wedging "already running".
         release_running_job(job_id, home=_claim_home, owner=registration_owner)
         _clear_run_claim_best_effort()
-        logger.exception(
-            "Job '%s' not dispatched: execution creation failed: %s", job_label, execution_err)
+        if execution is not None:  # the receipt was persisted; a later step failed
+            settle_unstarted_execution(execution["id"], job_id, (
+                f"Dispatch preparation failed: {type(execution_err).__name__}: {execution_err}"))
+        logger.exception("Job '%s' not dispatched: %s failed: %s", job_label,
+                         "execution creation" if execution is None else "dispatch preparation",
+                         execution_err)
         return None
 
     def _run_and_release(j=dispatched_job, ctx=_ctx, home=_claim_home):
@@ -4468,6 +4460,7 @@ from cron.scheduler_preflight import (  # noqa: E402
 # tick paths see every name they need.
 if __name__ == "__main__":
     if "--external-worker-file" in sys.argv:
+        finish_worker_boot()  # may relaunch: before the payload is read and the ack published
         import argparse
 
         parser = argparse.ArgumentParser(add_help=False)
