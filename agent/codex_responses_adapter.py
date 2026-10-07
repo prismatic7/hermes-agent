@@ -77,6 +77,9 @@ def _leaked_tool_call_text(text: str) -> bool:
     """True when assistant text carries a tool call the model failed to emit as a structured ``function_call``."""
     if _TOOL_CALL_LEAK_PATTERN.search(text):
         return True
+    # The response IS a serialized call object (whole-text, both dialects of the Chat shape).
+    if text and _TOOL_CALL_OBJECT_LEAK_PATTERN.match(text):
+        return True
     match = _SHELL_JSON_LEAK_PATTERN.search(text)
     if not match:
         return False
@@ -94,7 +97,25 @@ _NATIVE_TOOL_CALL_LEAK_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Unambiguous call markup in EITHER dialect. The context-sensitive Codex-CLI ``{"cmd": ...}``
+# OpenAI/Chat-Completions wire dialect leaked as assistant text: the whole response IS a
+# serialized tool call, ``{"name": "<tool>", "arguments": {...}}``. Sibling of the two above
+# because it is a THIRD shape, not a variant of either — measured 2026-10-07 (custodian:
+# escalation-runner): the delivered "answer" was exactly this, 430 chars of
+# ``{"name": "terminal", "arguments": {"command": ...}}``, and NONE of the existing detectors
+# matched it, so it went to Chris's channel verbatim.
+#
+# Deliberately anchored: it must be the WHOLE text (leading/trailing whitespace only), which is
+# what a leaked call is. A prose answer that merely QUOTES such an object — explaining the tool
+# schema, showing an example, this very comment if it were output — is a legitimate reply and
+# must survive. Requiring both the whole-text anchor and the ``name``+``arguments`` pair keeps
+# that distinction, and is why this does not go into _SHELL_JSON_LEAK_PATTERN (which is
+# context-scored by a preceding action lead-in instead).
+_TOOL_CALL_OBJECT_LEAK_PATTERN = re.compile(
+    r'^\s*\{\s*"name"\s*:\s*"(?:[^"\\]|\\.)*"\s*,\s*"arguments"\s*:\s*(?:\{.*\}|"(?:[^"\\]|\\.)*")\s*\}\s*$',
+    re.DOTALL,
+)
+
+# Unambiguous call markup in ANY dialect. The context-sensitive Codex-CLI ``{"cmd": ...}``
 # heuristic is deliberately outside this one: it needs a preceding action lead-in, so reasoning
 # that merely *discusses* a command would trip it.
 _LEAKED_CALL_MARKUP_PATTERN = re.compile(
@@ -113,7 +134,10 @@ def reasoning_carries_leaked_call(text: str) -> bool:
     call markup of either dialect, which is what makes the stricter screen safe at the delivery
     sites and only there (``turn_final_response`` promotion, ``turn_empty_response._terminal_empty``).
     """
-    return bool(text) and bool(_LEAKED_CALL_MARKUP_PATTERN.search(text))
+    return bool(text) and (
+        bool(_LEAKED_CALL_MARKUP_PATTERN.search(text))
+        or bool(_TOOL_CALL_OBJECT_LEAK_PATTERN.match(text))
+    )
 
 
 # The Codex backend rejects literal Harmony wire tokens (``invalid_prompt: Request

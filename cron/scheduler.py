@@ -2118,6 +2118,28 @@ def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgen
             final_response, result.get("messages", []))
     if final_response.strip() == "(No response generated)":
         final_response = ""
+    # A response that IS a serialized tool call is not an answer. Some models emit the call as
+    # plain text instead of a structured tool_call; the turn then completes normally and cron
+    # delivers the call markup to Chris's channel verbatim. Measured 2026-10-07
+    # (custodian:escalation-runner, 1 run in 50): the delivered "answer" was 430 chars of
+    # {"name": "terminal", "arguments": {...}} while the queue was empty and the correct
+    # response was [SILENT].
+    #
+    # The existing leaked-call screen lives in the Codex Responses adapter and the reasoning
+    # promotion path, so it never sees this — the job runs nemotron-3-super:cloud. This is the
+    # model-agnostic seam every cron response crosses, so it belongs here.
+    #
+    # Suppress, do not deliver: the model failed to act rather than report, and there is no
+    # answer to show. Treating it as empty routes it through the [SILENT] path, which is the
+    # honest outcome and what the job's own contract asks for.
+    if final_response.strip():
+        from agent.codex_responses_adapter import _leaked_tool_call_text
+        if _leaked_tool_call_text(final_response):
+            logger.warning(
+                "Job '%s': final response is leaked tool-call markup (%d chars), not an answer — "
+                "suppressing delivery. Snippet: %r",
+                job_name, len(final_response), final_response[:200])
+            final_response = ""
     # The "⚠️ No reply" turn-completion explainer would be delivered as a cron warning; detect it
     # via the same formatter and treat as empty so cron stays silent on abnormal empty turns.
     if final_response.strip() and turn_exit_reason:
