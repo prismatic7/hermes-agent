@@ -8,12 +8,18 @@ raw tool-call blob.
 The fixture is the delivered text byte-for-byte, read from
 `~/.hermes/cron/output/55a020e5fe8c/2026-09-27_08-01-11.md` line 498 onward.
 
-Both reasoning-delivery paths are covered because they are separate: the promotion in
-``turn_final_response`` (which fires when reasoning is promoted to the visible answer) and
-``turn_empty_response._terminal_empty`` (which surfaces reasoning ONLY on the exhausted-retries
-path). Covering one does not cover the other.
+Two reasoning-delivery paths existed because they are separate: the promotion in
+``turn_final_response`` (reasoning promoted to the visible answer) and
+``turn_empty_response._terminal_empty`` (reasoning surfaced on the exhausted-retries path).
+Covering one did not cover the other.
+
+Upstream 71c1669404e7 has since closed the SECOND path by construction — ``_terminal_empty`` no
+longer copies reasoning into the delivery text at all, so there is nothing there to screen. The
+screen now lives on the promotion path only. The path-2 tests below pin that new contract rather
+than the removed screen.
 """
 
+import pathlib
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -134,7 +140,13 @@ def _run_promotion(agent):
         turn_exit_reason="x", active_system_prompt="sys", preflight_compression_blocked=False,
         api_call_count=3,
     )
-    with patch("agent.turn_final_response.recover_empty_response", return_value=sentinel) as ladder:
+    # Upstream 71c1669404e7 gated promotion behind a TRUSTED route (agent/reasoning_promotion.py).
+    # A bare mock agent is not a trusted route, so promotion never happens and the screen never
+    # runs — which made these tests pass VACUOUSLY: the ladder ran for the wrong reason. Pin the
+    # capability open so the promotion definitely occurs and the SCREEN is what withholds.
+    # The route gate itself is covered by upstream's test_empty_terminal_reasoning_surface.py.
+    with patch("agent.turn_final_response.answer_in_reasoning_capability", return_value=True), \
+         patch("agent.turn_final_response.recover_empty_response", return_value=sentinel) as ladder:
         verdict = finish_text_response(
             agent, assistant_message=assistant_message, response=None, finish_reason="stop",
             messages=[], api_messages=[], conversation_history=[], api_call_count=3,
@@ -182,6 +194,15 @@ def test_promotion_is_what_leaked_without_the_screen():
 
 
 # ---- delivery path 2: turn_empty_response._terminal_empty -------------------------------------
+#
+# Upstream 71c1669404e7 removed the exhausted-recovery reasoning preview entirely: `_terminal_empty`
+# now returns the `(empty)` sentinel and NEVER copies reasoning into the delivery text. The screen
+# that used to guard this path is gone with it, because there is no longer anything here to leak.
+#
+# This is the stronger fix — the old screen withheld reasoning only when it *looked* like call
+# markup; removing the preview withholds the model's private chain-of-thought in every case
+# (#111761, #114082: users were shown the model's private thoughts as the reply). The screen
+# therefore lives on the promotion path only, and these tests pin the new contract.
 
 def _empty_agent(reasoning: str):
     agent = MagicMock()
@@ -196,29 +217,34 @@ def _empty_agent(reasoning: str):
     return agent
 
 
-def test_terminal_empty_withholds_reasoning_that_is_a_leaked_tool_call():
+def test_terminal_empty_never_surfaces_reasoning_at_all():
+    """The exhausted-retries path returns the sentinel even for innocuous reasoning."""
+    agent = _empty_agent("The disk is fine; nothing to report.")
+    final = ter._terminal_empty(agent, SimpleNamespace(), "stop", [])
+    assert final == "(empty)"
+    assert "The disk is fine; nothing to report." not in final
+
+
+def test_terminal_empty_withholds_the_leaked_call_blob():
+    """The 2026-09-27 failure mode cannot recur on this path — there is no preview to leak."""
     agent = _empty_agent(BLOB)
     messages = []
     final = ter._terminal_empty(agent, SimpleNamespace(), "stop", messages)
+    assert final == "(empty)"
     assert BLOB not in final
     assert BLOB_PREVIEW_MARK not in final
     assert "<function=tool_call>" not in final
-    # Still says what happened and what to do — withholding must not swallow the diagnosis.
-    assert "nemotron-3-nano:30b-cloud" in final
-    assert "/retry" in final
-    # The persisted row keeps the sentinel; the withheld text is only kept out of the DELIVERY text.
+    # The persisted row still keeps the sentinel.
     assert messages[-1]["_empty_terminal_sentinel"] is True
 
 
-def test_terminal_empty_still_surfaces_ordinary_reasoning():
-    agent = _empty_agent("The disk is fine; nothing to report.")
-    final = ter._terminal_empty(agent, SimpleNamespace(), "stop", [])
-    assert "The disk is fine; nothing to report." in final
-
-
-def test_terminal_empty_is_what_leaked_without_the_screen():
-    """Falsification companion for the second path: without the screen the preview is delivered."""
-    agent = _empty_agent(BLOB)
-    with patch("agent.turn_empty_response.reasoning_carries_leaked_call", return_value=False):
-        final = ter._terminal_empty(agent, SimpleNamespace(), "stop", [])
-    assert BLOB_PREVIEW_MARK in final
+def test_terminal_empty_does_not_reference_the_screen_or_the_copy_table():
+    """Guards the removal itself: the dead screen and its table dependency must not creep back."""
+    src = pathlib.Path(ter.__file__).read_text()
+    assert "reasoning_carries_leaked_call" not in src, (
+        "the screen was removed from this path by upstream's route-gating change; re-adding it "
+        "here would be dead code and would re-import a dependency for nothing"
+    )
+    assert "site_copy" not in src, (
+        "upstream removed the reasoning_only copy key; calling site_copy here would KeyError"
+    )
