@@ -370,6 +370,24 @@ merge_upstream() {
         return 0
       fi
       ;;
+    # Partial clone could not lazily fetch an object it needs. The first attempt still
+    # populates part of the store, so a second attempt frequently finds everything it
+    # needs without fetching again (measured 2026-10-07: attempt 1 rc=128, attempt 2 rc=0
+    # with no config change). Retry once, and fetch the named object directly if we can.
+    *"from promisor remote"*|*"upload-pack: not our ref"*)
+      echo "  merge could not lazily fetch an object (partial clone) — retrying once"
+      # Pull the object the failure named straight from a remote that has it.
+      for _sha in $(printf '%s\n' "$err" | grep -oE '\b[0-9a-f]{40}\b' | sort -u); do
+        git -C "$SCRATCH_CLONE" fetch --quiet origin "$_sha" 2>/dev/null \
+          || git -C "$SCRATCH_CLONE" fetch --quiet fork "$_sha" 2>/dev/null || true
+      done
+      git -C "$SCRATCH_CLONE" merge --abort 2>/dev/null || true
+      if err="$(git -C "$SCRATCH_CLONE" merge --no-edit --quiet origin/main 2>&1)"; then
+        echo "  retry succeeded"
+        return 0
+      fi
+      echo "  retry failed too — treating as a real failure"
+      ;;
   esac
   MERGE_ERR="$err"
   # Read the conflict list BEFORE aborting — abort clears it (bug 1).
@@ -538,6 +556,35 @@ if [ "$(git -C "$HERMES_DIR" config --get remote.origin.promisor || true)" = "tr
   git -C "$SCRATCH_CLONE" config core.repositoryformatversion 1
   git -C "$SCRATCH_CLONE" config remote.origin.promisor true
   git -C "$SCRATCH_CLONE" config remote.origin.partialclonefilter "${LIVE_FILTER:-tree:0}"
+
+  # The FORK is a promisor remote too, and the merge cannot succeed without it.
+  #
+  # This merge combines origin/main (upstream) with the fork branch. Blobs that exist
+  # ONLY on the fork side — anything a carried commit touched that upstream has since
+  # rewritten or deleted — are absent from the scratch store, because the clone was
+  # taken from the live checkout and the live checkout has never checked them out.
+  # `git merge` then needs them to compute the result and asks the promisor:
+  #
+  #   fatal: remote error: upload-pack: not our ref <sha>
+  #   fatal: could not fetch <sha> from promisor remote
+  #
+  # and dies with rc=128 and an EMPTY conflict list. The failure handler reads an empty
+  # conflict list as "not a content conflict" and reports exactly that — which is true
+  # but useless, because it is a missing-object failure, not a conflict at all.
+  #
+  # Upstream alone cannot serve those blobs (they are fork-only), so declaring only
+  # origin a promisor leaves them unfetchable. A retry sometimes wins — the first
+  # attempt populates enough of the store that the second finds what it needs — which
+  # is why this surfaced as an intermittent failure rather than a hard one.
+  #
+  # sma's live checkout already carries remote.fork.promisor=true (blob:none); copy
+  # that intent here so the scratch clone can fetch fork-side blobs on demand.
+  if [ "$(git -C "$HERMES_DIR" config --get remote.fork.promisor || true)" = "true" ]; then
+    git -C "$SCRATCH_CLONE" config remote.fork.promisor true
+    git -C "$SCRATCH_CLONE" config remote.fork.partialclonefilter \
+      "$(git -C "$HERMES_DIR" config --get remote.fork.partialclonefilter || echo blob:none)"
+    echo "  (fork is a promisor remote — scratch clone can fetch fork-side blobs on demand)"
+  fi
 fi
 
 # Upstream violates its own .gitattributes: it declares `*.yaml text eol=lf`,
