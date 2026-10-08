@@ -38,7 +38,7 @@ def _watched_db_paths(db_path: Path) -> set:
     return {canonical_db, canonical_db + "-wal", canonical_db + "-shm"}
 
 
-def _lsof_foreign_db_holder_pids(watched: set) -> Optional[List[int]]:
+def _lsof_foreign_db_holder_pids(watched: set) -> Optional[list[int]]:
     """Holder PIDs via ``lsof`` — the macOS/BSD path (no ``/proc`` there).
 
     ``lsof -F pn`` emits one field per line (``p<pid>``, ``n<path>``), so no column
@@ -53,7 +53,7 @@ def _lsof_foreign_db_holder_pids(watched: set) -> Optional[List[int]]:
     import subprocess
 
     own_pid = os.getpid()
-    pids: List[int] = []
+    pids: list[int] = []
     try:
         out = subprocess.run(
             ["lsof", "-F", "pn", "--", *sorted(watched)],
@@ -74,7 +74,7 @@ def _lsof_foreign_db_holder_pids(watched: set) -> Optional[List[int]]:
     return sorted(set(pids))
 
 
-def _foreign_db_holder_pids(db_path: Path) -> Optional[List[int]]:
+def _foreign_db_holder_pids(db_path: Path) -> Optional[list[int]]:
     """PIDs of OTHER processes holding *db_path* or its WAL/SHM open.
 
     ``/proc/<pid>/fd`` scan on Linux (no psutil dependency); ``lsof`` on
@@ -94,7 +94,7 @@ def _foreign_db_holder_pids(db_path: Path) -> Optional[List[int]]:
     if not sys.platform.startswith("linux"):
         return _lsof_foreign_db_holder_pids(watched)
 
-    pids: List[int] = []
+    pids: list[int] = []
     try:
         own_pid = os.getpid()
         for pid_str in os.listdir("/proc"):
@@ -529,7 +529,7 @@ def _extract_member_atomically(
         raise
 
 
-def _count_session_rows(path: Path) -> Optional[Tuple[int, int]]:
+def _count_session_rows(path: Path) -> Optional[tuple[int, int]]:
     """Return ``(sessions, messages)`` stored in the session database *path*.
 
     Read-only and best effort.  ``None`` means "unknown" — a missing file, a
