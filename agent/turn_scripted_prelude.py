@@ -22,13 +22,6 @@ from agent.transports.types import NormalizedResponse, build_tool_call
 from agent.turn_tool_round import run_tool_round
 
 Prelude = Generator[tuple[str, str, dict], Optional[str], None]
-# ^ the 3rd parameter is REQUIRED on Python 3.11/3.12: typing.Generator enforces its
-#   arity at RUNTIME for a module-level alias like this one, so the 2-arg form raises
-#   `TypeError: Too few arguments for typing.Generator; actual 2, expected 3` at IMPORT.
-#   That kills `agent.conversation_loop`, which `gateway/run.py:41` imports at module
-#   level => the gateway cannot start. `from __future__ import annotations` does NOT
-#   help: this is an assignment, not an annotation. 3-arg is the correct spelling on
-#   every supported version (pyproject: requires-python >=3.11,<3.15).
 
 
 def run_scripted_prelude(agent: Any, s: Any, prelude: Prelude) -> Any:
