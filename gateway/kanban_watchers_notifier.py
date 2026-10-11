@@ -337,7 +337,6 @@ class _Collector:
         """Claim events on one board, appending delivery dicts to ``deliveries``."""
         if not self._board_has_subs(slug):
             return
-        kb = self.kb
         try:
             conn = _kbc().connect(board=slug)
         except Exception as exc:
@@ -803,7 +802,7 @@ class _KanbanNotification:
                 if self.wake_kinds:
                     wake_payloads.append((self.synth, self.wake_diagnostic, self.wake_kinds))
             self.d = {**self.d, "events": original_events}
-        wake_kinds, is_push = self.wake_kinds, self.is_push_adapter
+        is_push = self.is_push_adapter
         from gateway.wake import WakeNotAccepted
 
         # A requested wake is required even when its passive ping already landed.
