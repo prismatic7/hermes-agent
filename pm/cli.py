@@ -522,10 +522,15 @@ def cmd_gc(args) -> int:
     generations = collect_generations(repo_root())
     runtimes = collect_runtime_generations(install_state_dir(repo_root()) / "pm-runtime")
     from pm.environments import installs_root
-    from pm.install_states import collect_orphan_install_states
-    orphans = collect_orphan_install_states(installs_root())
+    from pm.install_states import collect_orphan_install_states, unclaimed_install_states
+    unknown = unclaimed_install_states(installs_root())
+    orphans = collect_orphan_install_states(installs_root(),
+                                            sweep_unknown=getattr(args, "sweep_unknown", False))
     print(f"gc: removed {removed}, kept {kept}; removed {len(generations)} dependency generations, "
           f"{len(runtimes)} PM runtime generations, {len(orphans)} install state dir(s) of deleted checkouts")
+    if unknown and not getattr(args, "sweep_unknown", False):
+        print(f"gc: {len(unknown)} install state dir(s) have no checkout record; "
+              f"run `hermes pm gc --sweep-unknown` to reclaim the ones no live checkout claims")
     return 0
 
 
@@ -784,8 +789,8 @@ def cmd_status(args) -> int:
             when = warning.get("at") or warning.get("finished_at") or ""
             kind = warning.get("kind") or "sync"
             message = warning.get("message") or ""
-            print("  [warn] %s %s: %s" % (when, kind, message))
-            print("         receipt: %s" % warning.get("receipt"))
+            print(f"  [warn] {when} {kind}: {message}")
+            print(f"         receipt: {warning.get('receipt')}")
     if data is not None:
         print(_json.dumps(data, indent=2))
     return 0
@@ -863,6 +868,10 @@ def main(argv=None) -> int:
     p.set_defaults(func=cmd_repair)
 
     p = sub.add_parser("gc", help="remove store entries nothing references")
+    p.add_argument("--sweep-unknown", action="store_true",
+                   help="also reclaim install state dirs with no checkout record that no checkout "
+                        "under this data root claims (a legacy dir cannot name its checkout, so this "
+                        "cannot see one that shares this home from elsewhere)")
     p.set_defaults(func=cmd_gc)
 
     p = sub.add_parser("bundle", help="stage a payload (repo+store+facts+relocatable venv) into --out")

@@ -104,3 +104,90 @@ def test_aged_generations_are_capped_by_count(tmp_path, monkeypatch):
     assert runtime_state.collect_generations(repo, max_generations=0) == [], \
         "a same-day generation is protected by the age floor even at cap 0"
     assert fresh.parent.is_dir()
+
+
+def test_side_environment_generations_are_collected(tmp_path, monkeypatch):
+    """pm.testenv mints a new ``gen-*`` under ``test-environment/`` and rewrites ``active.json``
+    without removing the previous one; nothing visited that root, so a superseded test environment
+    leaked for the life of the install (observed live: 378 MB, inactive for 13 days)."""
+    import time
+
+    from hermes_cli.runtime_state import collect_generations
+    from pm.environments import install_state_dir
+    from pm.testenv import NAME as TEST_ENV
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    root = install_state_dir(repo) / TEST_ENV
+    old = root / ("gen-" + "a" * 32)
+    fresh = root / ("gen-" + "b" * 32)
+    selected = root / ("gen-" + "c" * 32)
+    for generation in (old, fresh, selected):
+        (generation / "venv").mkdir(parents=True)
+    (root / "active.json").write_text(json.dumps({"generation": selected.name, "inputs": "x"}),
+                                      encoding="utf-8")
+    stamp = time.time() - 3 * 86400
+    os.utime(old, (stamp, stamp))
+
+    assert collect_generations(repo) == [old]
+    assert selected.is_dir(), "the active.json selection is never a victim"
+    assert fresh.is_dir(), "a same-day generation is protected by the age floor"
+    assert not old.exists()
+
+
+def test_side_environment_generation_with_a_held_lease_is_kept(tmp_path, monkeypatch):
+    import time
+
+    from hermes_cli.runtime_state import collect_generations
+    from pm.environments import install_state_dir
+    from pm.filesystem import lock_fd
+    from pm.testenv import NAME as TEST_ENV
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    root = install_state_dir(repo) / TEST_ENV
+    held = root / ("gen-" + "a" * 32)
+    selected = root / ("gen-" + "c" * 32)
+    for generation in (held, selected):
+        (generation / "venv").mkdir(parents=True)
+    leases = held / ".leases"
+    leases.mkdir()
+    (root / "active.json").write_text(json.dumps({"generation": selected.name}), encoding="utf-8")
+    stamp = time.time() - 3 * 86400
+    os.utime(held, (stamp, stamp))
+
+    fd = os.open(leases / "reader", os.O_CREAT | os.O_RDWR, 0o600)
+    assert lock_fd(fd, wait=False)
+    try:
+        assert collect_generations(repo) == []
+        assert held.is_dir()
+    finally:
+        os.close(fd)
+    assert collect_generations(repo) == [held]
+
+
+def test_side_environment_without_a_readable_selection_is_left_alone(tmp_path, monkeypatch):
+    """A root whose ``active.json`` is unreadable or foreign cannot name its selection, so nothing
+    in it is provably safe to remove."""
+    import time
+
+    from hermes_cli.runtime_state import collect_generations
+    from pm.environments import install_state_dir
+    from pm.testenv import NAME as TEST_ENV
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    root = install_state_dir(repo) / TEST_ENV
+    for name in ("a" * 32, "b" * 32):
+        generation = root / ("gen-" + name)
+        (generation / "venv").mkdir(parents=True)
+        stamp = time.time() - 3 * 86400
+        os.utime(generation, (stamp, stamp))
+    (root / "active.json").write_text("{not json", encoding="utf-8")
+
+    assert collect_generations(repo) == []
+    assert sorted(p.name for p in root.iterdir() if p.name.startswith("gen-")) == \
+        ["gen-" + "a" * 32, "gen-" + "b" * 32]

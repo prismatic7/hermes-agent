@@ -10,6 +10,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import shutil
 import time
 import uuid
@@ -186,6 +187,79 @@ def lease_directory(generation: Path) -> Callable[[], None]:
 #: a generation the age floor protects.
 GENERATION_KEEP_COUNT = 20
 
+#: Direct children of the install state dir that are NOT side-environment roots: the application
+#: generations above, the manager runtime (`pm.runtime.collect_runtime_generations`), and the
+#: record dirs (inputs, bootstrap).
+_NON_SIDE_ENVIRONMENT = frozenset({"environments", "pm-runtime", "inputs", "bootstrap"})
+
+#: A generation directory is ``gen-<32 hex>`` (``pm.operations._ensure_generation``).
+_GENERATION_NAME = re.compile(r"gen-[0-9a-f]{32}\Z")
+
+
+def _side_environment_roots(state: Path) -> list[Path]:
+    """Generation-selected environment roots beside ``environments/``.
+
+    A side environment is an ordinary ``pm.operations`` root: ``active.json`` names the selected
+    ``gen-*`` and every build mints a new one and rewrites that file, never removing the previous
+    one. ``pm.testenv`` builds the test suite's under ``test-environment/``; nothing else knew about
+    it, so a superseded generation leaked for the life of the install (observed: 378 MB, 13 days).
+    Any direct child carrying a valid ``active.json`` is swept, so a future side environment is
+    covered without a name list.
+    """
+    roots: list[Path] = []
+    for candidate in sorted(state.iterdir()):
+        if (candidate.name in _NON_SIDE_ENVIRONMENT or candidate.name.startswith(".")
+                or candidate.is_symlink() or not candidate.is_dir()
+                or not (candidate / "active.json").is_file()):
+            continue
+        roots.append(candidate)
+    return roots
+
+
+def _selected_side_generation(root: Path) -> str | None:
+    """The ``gen-*`` name ``active.json`` selects, or ``None`` when it cannot be trusted.
+
+    Fail closed: an unreadable or foreign selection leaves every generation in place, because
+    without a known selection nothing here is provably safe to remove.
+    """
+    try:
+        record = json.loads((root / "active.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    generation = record.get("generation") if isinstance(record, dict) else None
+    return generation if isinstance(generation, str) and _GENERATION_NAME.match(generation) else None
+
+
+def _collect_side_environment(root: Path, *, min_age_seconds: float) -> list[Path]:
+    """Remove unselected, aged generations of ONE side-environment root.
+
+    A build/selection runs under the root's own ``.install.lock`` (``pm.operations``), so an
+    in-flight one is skipped rather than raced. No side generation carries ``.lease-managed``, so
+    the age floor is the guard against a generation a reader took before the next build replaced
+    it -- the same "unselected and older than a day" contract the application collector uses.
+    """
+    selected = _selected_side_generation(root)
+    if selected is None:
+        return []
+    removed: list[Path] = []
+    fd = os.open(root / ".install.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        if not _lock(fd, wait=False):
+            return []  # a build or selection is in flight; skip rather than queue
+        for generation in sorted(root.iterdir()):
+            if (generation.name == selected or generation.is_symlink() or not generation.is_dir()
+                    or not _GENERATION_NAME.match(generation.name)):
+                continue
+            if time.time() - generation.stat().st_mtime < min_age_seconds:
+                continue
+            if leases_held(generation):
+                continue
+            shutil.rmtree(generation)
+            removed.append(generation)
+    finally:
+        os.close(fd)
+    return removed
+
 
 def collect_generations(project: Path, *, min_age_seconds: float = 86400,
                         max_generations: int | None = GENERATION_KEEP_COUNT) -> list[Path]:
@@ -201,6 +275,11 @@ def collect_generations(project: Path, *, min_age_seconds: float = 86400,
     hoard, which otherwise grows for ever: once the eligible set is larger than
     *max_generations*, the oldest excess goes. ``max_generations=None`` restores the
     pure age-floor behaviour.
+
+    Side-environment roots beside ``environments/`` are swept in the same pass
+    (:func:`_collect_side_environment`): they select a generation the same way but carry no
+    ``.lease-managed`` marker, so the age floor and the root's own ``.install.lock`` are their
+    guards. ``max_generations`` does not bound them.
     """
     from pm.environments import selected_venv
     removed = []
@@ -211,6 +290,8 @@ def collect_generations(project: Path, *, min_age_seconds: float = 86400,
         if not held:
             return removed  # maintenance: another process owns the install, skip rather than queue
         recover_publication(project)
+        for side in _side_environment_roots(root):
+            removed.extend(_collect_side_environment(side, min_age_seconds=min_age_seconds))
         selected = selected_venv(project).parent.resolve()
         generations = root / "environments"
         if not generations.is_dir():
