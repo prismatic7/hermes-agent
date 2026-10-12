@@ -78,13 +78,20 @@ def _pre_call_key(task_id: str, session_id: str, tool_call_id: str) -> tuple[str
 def _on_pre_tool_call(tool_name: str = "", args: Optional[dict[str, Any]] = None, task_id: str = "",
                       session_id: str = "", tool_call_id: str = "", **_: Any) -> None:
     """Snapshot which argument paths are absent before the call. Never raises: pre_tool_call hooks
-    fail CLOSED (a raise would block the tool), so an error records no absent path."""
+    fail CLOSED (a raise would block the tool), so an error records no absent path.
+
+    Only in-scope paths are stat-ed (``dg.may_be_tracked``): a path naming a hung network mount
+    would block this hook past its budget and, because ``pre_tool_call`` fails closed, block every
+    tool call in the profile. Out-of-scope paths are un-trackable regardless, and the post hook's
+    ``str(p) in absent`` guard means they are then never stat-ed there either.
+    """
     extractor = _PATH_EXTRACTORS.get(tool_name)
     if not tool_call_id or extractor is None or not isinstance(args, dict):
         return
     now = time.time()
     try:
-        absent = frozenset(str(p) for p in (Path(s).expanduser() for s in extractor(args)) if not p.exists())
+        absent = frozenset(str(p) for p in (Path(s).expanduser() for s in extractor(args)
+                                            if dg.may_be_tracked(s)) if not p.exists())
     except Exception:
         absent = frozenset()
     with _lock:

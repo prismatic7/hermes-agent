@@ -12,6 +12,7 @@ import contextlib
 import functools
 import json
 import logging
+import os
 import shutil
 from datetime import datetime, timezone, UTC
 from pathlib import Path
@@ -54,6 +55,26 @@ def is_safe_path(path: Path) -> bool:
     except (ValueError, OSError):
         return False
     return bool(relative_tmp.parts and relative_tmp.parts[0].startswith("hermes-"))
+
+
+def may_be_tracked(path_str: str) -> bool:
+    """Could ``track()`` ever accept this raw path string? Pure string work — no syscalls.
+
+    ``_on_pre_tool_call`` must not stat a path outside the plugin's own scope. ``exists()`` on a
+    token naming a hung network mount (``/Volumes/<share>``) blocks in the kernel for minutes, and
+    a ``pre_tool_call`` hook that blocks is fail-closed (``hermes_cli/plugins_dispatch.py``) — one
+    dead mount would block EVERY tool call until the gateway restarts. ``is_safe_path`` cannot do
+    this job: it resolves the path first, which is itself the unsafe call. Anything rejected here
+    could not have been tracked anyway, so skipping it loses nothing.
+
+    ``~user`` forms are rejected rather than expanded — ``os.path.expanduser`` hits the password
+    database for them, which is slow-to-blocking on a networked directory service.
+    """
+    if path_str == "~" or path_str.startswith("~/"):
+        path_str = os.environ.get("HOME", "") + path_str[1:]
+    if path_str.startswith(str(get_hermes_home())):
+        return True
+    return path_str.startswith("/tmp/hermes-") or path_str.startswith("/private/tmp/hermes-")
 
 
 def _log(message: str) -> None:

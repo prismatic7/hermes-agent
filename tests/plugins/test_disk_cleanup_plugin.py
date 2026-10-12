@@ -638,6 +638,38 @@ class TestPostToolCallHook:
         assert not new_file.exists()
 
 
+class TestPreToolCallNeverStatsOutOfScopePaths:
+    """An out-of-scope path token must never be stat-ed.
+
+    ``pre_tool_call`` fails closed: a callback still running past ``plugins.hook_callback_timeout``
+    blocks EVERY tool call in the profile until a worker finishes or the gateway restarts.
+    ``Path.exists()`` on a hung network mount does not return, so a terminal command naming one
+    (``ls -la /Volumes/Backup``) must not reach a stat. Those paths are un-trackable anyway.
+    """
+
+    def test_scope_prefilter_is_pure_string_work(self, _isolate_env):
+        lib = _load_lib()
+        assert lib.may_be_tracked("/Volumes/DeadShare") is False
+        assert lib.may_be_tracked("//user@host/share") is False
+        assert lib.may_be_tracked("~deploy/test_x.py") is False  # ~user needs no pwd lookup
+        assert lib.may_be_tracked(str(_isolate_env / "test_x.py")) is True
+        assert lib.may_be_tracked("/tmp/hermes-abc/test_x.py") is True
+
+    def test_path_on_unreachable_mount_is_never_stat_ed(self, _isolate_env, monkeypatch):
+        real_exists = Path.exists
+        probed: list[str] = []
+
+        def spy(self):
+            probed.append(str(self))
+            return real_exists(self)
+
+        monkeypatch.setattr(Path, "exists", spy)
+        pi = _load_plugin_init()
+        pi._on_pre_tool_call(tool_name="terminal", args={"command": "ls -la /Volumes/DeadShare"},
+                             session_id="s1", tool_call_id="call-dead")
+        assert probed == []
+
+
 class TestOnSessionEndHook:
     def test_runs_quick_when_test_files_tracked(self, _isolate_env):
         pi = _load_plugin_init()
