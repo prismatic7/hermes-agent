@@ -343,20 +343,21 @@ def _workspace_member(plugin_dir: Path, root: Path, *, identity: Path) -> Path:
                 spec["path"] = (identity / relative).resolve().as_posix()
                 changed = True
         if virtual:
-            project = document.setdefault("project", {})
-            project["name"] = f"hermes-plugin-{key}"
-            # uv REQUIRES [project] to carry a version (or declare it dynamic) even for a
-            # metadata-only member. A plugin whose pyproject holds only tooling config —
-            # hermes-lcm's is a ruff section with no [project] table at all — reaches here
-            # without one, and uv then refuses to parse the member, which fails `uv lock` for
-            # the WHOLE workspace. The eviction path reads that as "the plugin does not fit"
-            # and writes it into plugins.disabled, so the plugin silently stops loading; for a
-            # context engine that also stops its per-turn ingest, with no error anywhere the
-            # operator would see. Give the virtual member the same placeholder version the
-            # no-pyproject branch below already uses.
-            dynamic = project.get("dynamic")
-            if "version" not in project and not (isinstance(dynamic, list) and "version" in dynamic):
-                project["version"] = "0.0.0"
+            document.setdefault("project", {})["name"] = f"hermes-plugin-{key}"
+        project = document.get("project")
+        # uv REQUIRES [project] to carry a version (or declare it dynamic) even for a
+        # metadata-only member. A plugin whose pyproject holds only tooling config —
+        # hermes-lcm's is a ruff section with no [project] table at all — reaches here
+        # without one, and uv then refuses to parse the member, which fails `uv lock` for
+        # the WHOLE workspace. The eviction path reads that as "the plugin does not fit"
+        # and writes it into plugins.disabled, so the plugin silently stops loading; for a
+        # context engine that also stops its per-turn ingest, with no error anywhere the
+        # operator would see. Give the member the same placeholder version the no-pyproject
+        # branch below already uses. PEP 621 forbids a static version while "version" is
+        # listed under project.dynamic, so an explicitly dynamic version is left alone.
+        if project is not None and "version" not in project and "version" not in project.get("dynamic", ()):
+            project["version"] = "0.0.0"
+            changed = True
         if virtual or changed:
             import tomli_w
 
