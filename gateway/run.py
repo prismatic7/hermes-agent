@@ -42,7 +42,7 @@ from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.interrupt_compat import request_hard_interrupt
 from agent.message_metadata import ABSORBED_MESSAGE_UIDS, MESSAGE_UID, copy_identity_fields
 from agent.turn_context import compression_made_progress
-from agent.session_activity import ActivityProvenance
+from agent.session_activity import ActivityProvenance, AwakeIdleMeter
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import pre_agent_fallback_notice
 from gateway.turn_executor import _UnboundedThreadExecutor
@@ -777,11 +777,10 @@ def _approval_send_outcome(future, timeout: float) -> str:
         return "failed"
     if getattr(result, "success", False):
         return "sent"
-    # P5(b): a connector DECLINE is not a lane failure. The connector
-    # authorized the destination and refused it; re-sending the same content as
-    # plain text into that same chat is the exfiltration the egress guard
-    # exists to stop. `failed` is the cue to fall back, so a decline needs its
-    # own verdict — callers must surface it and send nothing further.
+    # P5(b): a connector DECLINE is not a lane failure. The connector authorized the destination and refused it;
+    # re-sending the same content as plain text into that same chat is the exfiltration the egress guard exists
+    # to stop. `failed` is the cue to fall back, so a decline needs its own verdict — callers must surface it 
+    # and send nothing further.
     #
     # CLASSIFY THE STRUCTURED RESPONSE, NOT THE ERROR STRING. The adapter
     # preserves the connector's own dict in `raw_response`; rebuilding a dict
@@ -2746,6 +2745,7 @@ def _watch_gateway_turn_inactivity(
     retain the session turn lease forever because every watchdog poll just skips it.
     """
     activity_origin = time.monotonic()
+    awake_idle = AwakeIdleMeter()  # host sleep is not idleness
     while not worker_done.wait(max(0.01, poll_interval)):
         now = time.monotonic()
         idle_seconds = now - activity_origin
@@ -2754,7 +2754,7 @@ def _watch_gateway_turn_inactivity(
             try:
                 reported_idle = agent.get_activity_summary().get("seconds_since_activity")
                 if reported_idle is not None:
-                    idle_seconds = max(0.0, float(reported_idle))
+                    idle_seconds = awake_idle.measure(max(0.0, float(reported_idle)))
                     # Preserve the most recent usable activity clock as the fallback if
                     # a later provider-side diagnostic read raises or returns None.
                     activity_origin = now - idle_seconds
@@ -3319,24 +3319,12 @@ def _builtin_adapter_import(module: str, adapter_name: str, requirement: str):
 
 # platform -> (module, adapter class, requirements probe, warning on probe failure).
 _BUILTIN_ADAPTERS: dict[Platform, tuple[str, str, str, str]] = {
-    Platform.WHATSAPP_CLOUD: ("whatsapp_cloud", "WhatsAppCloudAdapter", "check_whatsapp_cloud_requirements",
-                              "WhatsApp Cloud: aiohttp/httpx missing — reinstall hermes-agent"),
-    Platform.SIGNAL: ("signal", "SignalAdapter", "check_signal_requirements",
-                      "Signal: runtime requirements not met"),
-    Platform.WEIXIN: ("weixin", "WeixinAdapter", "check_weixin_requirements",
-                      "Weixin: aiohttp/cryptography not installed"),
     Platform.API_SERVER: ("api_server", "APIServerAdapter", "check_api_server_requirements",
                           "API Server: aiohttp not installed"),
     Platform.WEBHOOK: ("webhook", "WebhookAdapter", "check_webhook_requirements",
                        "Webhook: aiohttp not installed"),
     Platform.MSGRAPH_WEBHOOK: ("msgraph_webhook", "MSGraphWebhookAdapter", "check_msgraph_webhook_requirements",
-                               "MSGraph webhook: aiohttp not installed"),
-    Platform.BLUEBUBBLES: ("bluebubbles", "BlueBubblesAdapter", "check_bluebubbles_requirements",
-                           "BlueBubbles: aiohttp/httpx missing or BLUEBUBBLES_SERVER_URL/BLUEBUBBLES_PASSWORD not configured"),
-    Platform.QQBOT: ("qqbot", "QQAdapter", "check_qq_requirements",
-                     "QQBot: aiohttp/httpx missing or QQ_APP_ID/QQ_CLIENT_SECRET not configured"),
-    Platform.YUANBAO: ("yuanbao", "YuanbaoAdapter", "WEBSOCKETS_AVAILABLE",
-                       "Yuanbao: websockets not installed. Run: pip install websockets")}
+                               "MSGraph webhook: aiohttp not installed")}
 
 
 def _instantiate_builtin_adapter(platform: Platform, config: Any) -> Optional[BasePlatformAdapter]:
@@ -3349,11 +3337,6 @@ def _instantiate_builtin_adapter(platform: Platform, config: Any) -> Optional[Ba
     if not (requirements_ok() if callable(requirements_ok) else requirements_ok):
         logger.warning(warning)
         return None
-    if platform == Platform.SIGNAL:
-        from gateway.platforms.signal import validate_signal_config
-        if not validate_signal_config(config):
-            logger.warning("Signal: SIGNAL_HTTP_URL or SIGNAL_ACCOUNT not configured")
-            return None
     return adapter_cls(config)
 
 
@@ -4373,30 +4356,6 @@ def _housekeeping_channel_directory(adapters, loop) -> None:
             fut.result(timeout=30)
 
 
-def _housekeeping_media_caches() -> None:
-    """Every platform media cache prunes on the same hourly cadence (24h max age)."""
-    from gateway.platforms.base import (
-        cleanup_audio_cache, cleanup_document_cache, cleanup_image_cache, cleanup_screenshot_cache,
-        cleanup_video_cache)
-    from tools.tool_result_storage import cleanup_spillover_cache
-    from tools.environments.local import cleanup_terminal_temp_cache
-    from tools.bot_mode_dm import cleanup_bot_dm_cache
-    from tools.bot_relay import cleanup_bot_relay_artifacts
-    from agent.provider_media import MEDIA_CACHE_MAX_AGE_HOURS
-
-    for cache_name, cleanup_fn in (
-        ("Image", cleanup_image_cache), ("Document", cleanup_document_cache),
-        ("Audio", cleanup_audio_cache), ("Video", cleanup_video_cache),
-        ("Screenshot", cleanup_screenshot_cache), ("Spillover", cleanup_spillover_cache),
-        ("Terminal temp", cleanup_terminal_temp_cache), ("Bot DM", cleanup_bot_dm_cache),
-        ("Bot relay", cleanup_bot_relay_artifacts)):
-        def _one(name=cache_name, fn=cleanup_fn):
-            removed = fn(max_age_hours=MEDIA_CACHE_MAX_AGE_HOURS)
-            if removed:
-                logger.info("%s cache cleanup: removed %d stale file(s)", name, removed)
-        _housekeeping_chore(f"{cache_name} cache cleanup", _one)
-
-
 def _housekeeping_paste_sweep() -> None:
     from hermes_cli.debug import _sweep_expired_pastes
     deleted, remaining = _sweep_expired_pastes()
@@ -4552,6 +4511,7 @@ def _start_gateway_housekeeping(
     Cadences are ticks of ``interval``; inner gates own the real cadence."""
     from gateway.run_delivery_queue_watch import DRAIN_LABEL, DeliveryQueueWatch, wait_for_next_tick
     from gateway.run_profile_reconcile import _mcp_config_reconciler, profile_scoped_chore
+    from gateway.run_housekeeping_disk import housekeeping_media_caches, maybe_post_auto_prune_prompt
     chores: list[tuple[int, str, Any]] = [
         # First every tick: re-stamp ``updated_at`` in gateway_state.json so it is a real heartbeat.
         # ``hermes gateway status`` / ``/api/status`` warn when it ages past 2x ``interval`` with the
@@ -4564,8 +4524,10 @@ def _start_gateway_housekeeping(
         chores.append((1, DRAIN_LABEL, lambda: _drain_restart_safe_cron_deliveries(adapters, loop, runner)))
     chores += [
         (5, "Channel directory refresh", lambda: adapters and _housekeeping_channel_directory(adapters, loop)),
-        (60, "Media cache cleanup", _housekeeping_media_caches),
+        (60, "Media cache cleanup", housekeeping_media_caches),
         (60, "Paste sweep", _housekeeping_paste_sweep)]
+    # Low disk + auto-prune undecided: ask on the home channel (two syscalls; snoozed per post).
+    chores.append((1, "Auto-prune low-disk prompt", lambda: maybe_post_auto_prune_prompt(runner, loop)))
     if cron_provider is not None:
         chores.append((5, "Misfire catch-up sweep", lambda: _housekeeping_misfire_catch_up(cron_provider, adapters, loop)))
     if cron_thread is not None:

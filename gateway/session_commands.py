@@ -24,7 +24,7 @@ _CONTROL_COMMANDS = frozenset({'title'})
 # cached agent, the /debug summary upload, /blueprint's job creation. A turn the handler would have
 # pushed onto the adapter FIFO comes back as a ``send`` directive (gateway/session_command_sink.py).
 _HANDLER_CONTROLS = frozenset({'goal', 'subgoal', 'loop', 'heartbeat', 'review', 'refine', 'debug', 'curator',
-                               'login'})
+                               'login', 'autoprune'})
 # Idle-path commands the messaging gateway answers by rewriting the turn (``_hm_cmd_<name>``,
 # gateway/run_inbound.py): the rewritten text is returned as the client's ``send`` directive.
 _PROMPT_COMMANDS = frozenset({'plan', 'learn', 'init', 'moa', 'blueprint', 'egress'})
@@ -255,7 +255,7 @@ async def execute_command(connection, ref, params, *, dispatch=False):
         return {'type': 'exec', 'output': _text(output)}
     if definition is None:
         def build():
-            with _profile_runtime_scope(home):
+            with _profile_runtime_scope(home), _session_workspace(authority.runner, live.source):
                 return _skill_directive(name, arg, live.route)
         return await asyncio.to_thread(build)
 
