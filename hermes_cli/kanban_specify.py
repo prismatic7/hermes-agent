@@ -235,7 +235,12 @@ def specify_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Task ids in the triage column; ``tenant`` narrows the sweep."""
+    """Task ids in the triage column, minus the parked ones; ``tenant`` narrows the sweep.
+
+    A card carrying an open block is waiting on a human; promoting it would put
+    it back into dispatch without the answer. Naming the id explicitly still
+    works — that is the human releasing it.
+    """
     with kbc.connect_closing() as conn:
         tasks = kb.list_tasks(conn, status="triage", tenant=tenant, include_archived=False)
-    return [t.id for t in tasks]
+        return [t.id for t in tasks if not kb.has_open_block(conn, t.id)]

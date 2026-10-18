@@ -2022,6 +2022,23 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(trip) and bool(_json_dict(trip["payload"]).get("sticky"))
 
 
+def has_open_block(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the newest block-family event post-dates the newest ``unblocked``.
+
+    ``block_kind`` cannot answer this: it deliberately survives an unblock (only
+    ``complete_task`` clears it). A ``block_loop_detected`` escalation parks the
+    card in ``triage`` with its block still open — waiting on a human, not on a
+    specifier — so the automatic triage sweeps (:func:`list_triage_ids` in
+    ``kanban_specify``/``kanban_decompose``) skip it.
+    """
+    row = conn.execute(
+        "SELECT kind FROM task_events WHERE task_id = ? "
+        "AND kind IN ('blocked', 'block_loop_detected', 'gave_up', 'unblocked') "
+        "ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    return row is not None and row["kind"] != "unblocked"
+
+
 def _latest_event(
     conn: sqlite3.Connection, task_id: str, kind: str, run_id: Optional[int] = None,
 ) -> Optional[sqlite3.Row]:

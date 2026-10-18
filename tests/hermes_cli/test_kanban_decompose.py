@@ -256,3 +256,23 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert outcome.ok is False
 
 
+def test_triage_sweep_skips_a_card_whose_block_is_still_open(kanban_home):
+    """A block that escalated to triage must not be swept back into dispatch."""
+    from hermes_cli import kanban_specify as specify
+
+    with kbc.connect() as conn:
+        parked = kb.create_task(conn, title="deferred until Chris answers", triage=False)
+        # The real escalation route: block, unblock, re-block — the second
+        # block hits BLOCK_RECURRENCE_LIMIT and lands back in triage.
+        assert kb.block_task(conn, parked, reason="needs Chris", kind="needs_input")
+        assert kb.unblock_task(conn, parked)
+        assert kb.block_task(conn, parked, reason="still needs Chris", kind="needs_input")
+        parked_task = kb.get_task(conn, parked)
+        assert parked_task is not None and parked_task.status == "triage"
+        assert kb.has_open_block(conn, parked) is True
+
+        free = kb.create_task(conn, title="real triage work", triage=True)
+        assert kb.has_open_block(conn, free) is False
+
+    assert decomp.list_triage_ids() == [free]
+    assert specify.list_triage_ids() == [free]

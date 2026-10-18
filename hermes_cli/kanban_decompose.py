@@ -337,7 +337,12 @@ def decompose_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return task ids currently in the triage column, minus the parked ones.
+
+    A card carrying an open block is waiting on a human (``needs_input`` /
+    ``capability``, or a ``block_loop_detected`` escalation which lands back in
+    ``triage``); specifying it would promote it straight back into dispatch.
+    """
     with kbc.connect_closing() as conn:
         rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
-    return [row.id for row in rows]
+        return [row.id for row in rows if not kb.has_open_block(conn, row.id)]
