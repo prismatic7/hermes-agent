@@ -281,3 +281,36 @@ def test_compression_transition_provenances_surface_in_activity_summary(monkeypa
         assert summary["provenance"] == provenance.value
         assert summary["last_activity_description"] == desc
         assert summary["last_activity_desc"] == desc
+
+
+def test_persist_from_an_event_loop_writes_on_a_plain_thread(monkeypatch):
+    """Relay-wrapped tool execution drives the turn on an event loop, where a worker's durable
+    store refuses synchronous RPC (``synchronous_rpc_on_event_loop``) and makes that refusal
+    sticky — one heartbeat would fail the whole turn. The write must land off the loop.
+    """
+    import asyncio
+    import threading
+
+    agent = _agent_with_db()
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    written: list[str] = []
+    done = threading.Event()
+
+    def touch(*args, **kwargs):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            written.append(threading.current_thread().name)
+        else:
+            written.append("on-loop")
+        done.set()
+
+    agent._session_db.touch_session_activity.side_effect = touch
+
+    async def stamp():
+        agent._touch_activity("executing tool: write_file")
+
+    asyncio.run(stamp())
+
+    assert done.wait(5), "heartbeat never reached the session store"
+    assert written == ["session-activity-persist"], written

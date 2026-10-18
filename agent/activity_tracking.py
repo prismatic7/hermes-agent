@@ -3,6 +3,7 @@
 ``_touch_activity`` is the single write path; persistence is rate-limited and never raises.
 Extracted from ``run_agent.py``; every method resolves through ``AIAgent``'s MRO unchanged.
 """
+import asyncio
 import logging
 import os
 import threading
@@ -112,18 +113,30 @@ class ActivityTrackingMixin:
         if last_mono and (now_mono - last_mono) < SESSION_ACTIVITY_HEARTBEAT_MIN_INTERVAL_SECONDS:
             return
         self._session_activity_last_persist_mono = now_mono
+
+        def write() -> None:
+            try:
+                touch(
+                    session_id,
+                    getattr(self, "_last_activity_ts", None),
+                    description=getattr(self, "_last_activity_desc", None),
+                    provenance=normalize_activity_provenance(
+                        getattr(self, "_last_activity_provenance", None)
+                    ),
+                )
+            except Exception:
+                # Heartbeat is observation-only; never let its I/O break the loop.
+                logger.debug("session activity heartbeat write failed (ignored)", exc_info=True)
+
         try:
-            touch(
-                session_id,
-                getattr(self, "_last_activity_ts", None),
-                description=getattr(self, "_last_activity_desc", None),
-                provenance=normalize_activity_provenance(
-                    getattr(self, "_last_activity_provenance", None)
-                ),
-            )
-        except Exception:
-            # Heartbeat is observation-only; never let its I/O break the loop.
-            logger.debug("session activity heartbeat write failed (ignored)", exc_info=True)
+            asyncio.get_running_loop()
+        except RuntimeError:
+            write()
+        else:
+            # Relay-wrapped tool execution and stream setup drive the turn on an event loop, where a
+            # worker's store refuses synchronous RPC (``synchronous_rpc_on_event_loop``) and makes
+            # that refusal sticky — one heartbeat would fail the whole turn. A plain thread may write.
+            threading.Thread(target=write, name="session-activity-persist", daemon=True).start()
 
     def _reset_activity_labels_after_turn(self) -> None:
         """Drop mid-turn activity labels once the turn is no longer running.
