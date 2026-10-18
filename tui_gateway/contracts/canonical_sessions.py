@@ -17,7 +17,10 @@ class CanonicalSessionParams(ProfileParams):
 
 class CanonicalCreateParams(ProfileParams):
     request_id: str | None = None
-    source: Literal['cli', 'tui', 'gui', 'acp', 'tool', 'oneshot'] = 'cli'
+    # ``kanban``: a CLI child spawned inside a kanban worker inherits HERMES_SESSION_SOURCE
+    # (``agent/session_source.py`` keeps automation labels on purpose), so the owner must admit it
+    # as a CLI-surface creation or every nested ``hermes chat -q`` dies at session.create.
+    source: Literal['cli', 'tui', 'gui', 'acp', 'tool', 'oneshot', 'kanban'] = 'cli'
     cwd: str | None = None
     # The sessions-row ``cwd`` when it differs from the execution ``cwd`` (the classic CLI records
     # main's stamp: the launch dir, ``""`` = none); ``cwd`` stays where the tools run.
