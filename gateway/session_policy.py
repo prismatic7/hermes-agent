@@ -74,11 +74,37 @@ _ACTIVE_POLICY: ContextVar = ContextVar('local_session_policy', default=None)
 _TURN_PROFILE: ContextVar = ContextVar('follow_profile_read', default=None)  # (policy, live) for a turn
 # Creation label -> agent surface. ``tool`` (third-party integrations, ``hermes chat --source tool``) and
 # ``oneshot`` (finite ``chat -q`` / ``-z`` runs) run as the CLI but keep their own stored label, so human
-# pickers hide them (INTERNAL_LISTING_SOURCES).
+# pickers hide them (INTERNAL_LISTING_SOURCES). ``kanban`` is the same shape: a CLI child launched inside a
+# kanban worker inherits HERMES_SESSION_SOURCE=kanban (agent/session_source.py keeps automation labels on
+# purpose), so the canonical create contract admits it as a cli-surface session — without it every nested
+# ``hermes chat -q`` dies at session.create with 4001 invalid_params fields:[source].
 SURFACES = {'cli': 'cli', 'tui': 'tui', 'gui': 'desktop', 'acp': 'acp', 'tool': 'cli', 'oneshot': 'cli',
-            # A CLI child launched inside a kanban worker keeps the inherited label for the row
-            # (hidden from pickers) but runs a CLI surface.
             'kanban': 'cli'}
+# ``tool``, ``oneshot`` and ``kanban`` stay stored under their own labels so pickers can hide them.
+# Every other creation label is rewritten to ``source='local'`` on peer refresh.
+_KEEP_STORED_LABEL = frozenset({'tool', 'oneshot', 'kanban'})
+STORED_AS_LOCAL = frozenset(SURFACES) - _KEEP_STORED_LABEL
+# Routing labels and the accounting placeholder: never a creating surface.
+_NOT_A_SURFACE = frozenset({None, '', 'local', 'unknown'})
+
+
+def created_surface(label):
+    """``created_source`` for a policy or live label.
+
+    ``local`` and ``unknown`` are not surfaces. A label stored as ``local`` maps
+    through ``SURFACES`` (``gui`` is ``desktop``). Any other label, including
+    ``tool``, ``oneshot`` and ``kanban``, is kept as itself: created_source is provenance.
+    """
+    if label in _NOT_A_SURFACE:
+        return None
+    return SURFACES[label] if label in STORED_AS_LOCAL else label
+
+
+# Policy label and agent surface for one conversation, keyed by either name: ``--source gui``
+# and ``--source desktop`` are the same rows. ``tool``, ``oneshot`` and ``kanban`` are not aliases of
+# ``cli`` here: they keep their own stored label.
+SURFACE_GROUPS = {name: group for group in (frozenset({label, SURFACES[label]}) for label in STORED_AS_LOCAL)
+                  for name in group}
 
 
 def _refuse(field, detail=None):
