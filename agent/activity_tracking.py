@@ -155,5 +155,6 @@ class ActivityTrackingMixin:
         clear = getattr(session_db, "clear_session_activity_labels", None)
         if not callable(clear):
             return
+        from agent.runtime_session_store import call_off_event_loop
         with suppress(Exception):  # never let durable cleanup I/O break turn teardown
-            clear(session_id)
+            call_off_event_loop(clear, session_id)
