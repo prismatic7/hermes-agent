@@ -5,11 +5,13 @@ import { introZh } from './intro-zh'
 import { zhCatalog, zhSkillDeepLink } from './zh_catalog'
 import { zhClarify } from './zh_clarify'
 import { zhConnectorCard } from './zh_connector_card'
+import { zhErrorLayers } from './zh_error_layers'
 import { zhFirstRun } from './zh_first_run'
 import { zhLocalModels } from './zh_local_models'
 import { zhModelMenu } from './zh_model_menu'
 import { zhModelSettings } from './zh_model_settings'
 import { zhNotices } from './zh_notices'
+import { zhNotifications } from './zh_notifications'
 import { zhOnboarding } from './zh_onboarding'
 import { zhProjects } from './zh_projects'
 import { zhSharedMetrics } from './zh_shared_metrics'
@@ -17,7 +19,6 @@ import { zhThemePicker } from './zh_theme_picker'
 import { zhUpdateChannel } from './zh_update_channel'
 
 export const zhOverrides = {
-
   catalog: zhCatalog,
   externalOpenFailed: {
     title: '无法打开此链接',
@@ -668,51 +669,7 @@ export const zhOverrides = {
         nothingToInstall: '此包在这里没有可安装的内容。'
       }
     },
-    notifications: {
-      title: '通知',
-      intro: '原生桌面通知，区别于应用内提示。设置按设备保存，每台电脑各自独立。',
-      enableAll: '启用通知',
-      enableAllDesc: '关闭后静音下方所有通知。',
-      focusedHint: '完成提醒仅在 Hermes 处于后台时触发。',
-      kinds: {
-        approval: {
-          label: '需要批准',
-          description: '有命令正在等待你批准或拒绝。'
-        },
-        input: {
-          label: '需要输入',
-          description: 'Hermes 提出了问题，或需要密码或密钥。'
-        },
-        turnDone: {
-          label: '回复就绪',
-          description: 'Hermes 在后台时完成了一轮对话。'
-        },
-        turnError: {
-          label: '本轮失败',
-          description: '后台回合错误。'
-        },
-        backgroundDone: {
-          label: '后台任务完成',
-          description: '后台终端命令已完成。'
-        },
-        credits: {
-          label: '额度提醒',
-          description: '额度访问被暂停或恢复。'
-        },
-        plugin: {
-          label: '插件通知',
-          description: 'Hermes 在后台时，桌面插件发送了通知。'
-        }
-      },
-      test: '发送测试通知',
-      testTitle: 'Hermes',
-      testBody: '通知工作正常。',
-      testSent: '测试已发送。如果没有出现，请检查系统通知权限和专注模式／勿扰模式。',
-      testUnsupported: '此系统不支持原生通知。',
-      completionSoundTitle: '完成提示音',
-      completionSoundDesc: '智能体回合结束时播放。可在此选择预设并预览。',
-      completionSoundPreview: '预览'
-    },
+    notifications: zhNotifications,
     sections: {
       model: '模型',
       chat: '对话',
@@ -4299,12 +4256,7 @@ export const zhOverrides = {
       react: '回应',
       dismissError: '关闭错误',
       errorGenericProvider: 'AI 服务',
-      errorLayerBodies: {
-        generic: 'Hermes 回复时出现问题。请重试；若问题持续，请复制错误详情。',
-        provider: 'AI 服务无法完成此请求。请稍后重试或切换服务商。',
-        endpoint: 'Hermes 无法连接到你的自定义模型服务器。请确认它正在运行，然后重新发送消息。',
-        streaming: '回复完成前连接已断开。请重试以重新发送。'
-      },
+      ...zhErrorLayers,
       errorCodes: {
         provider_policy_blocked: {
           title: '账户设置阻止了此模型',
@@ -4353,18 +4305,11 @@ export const zhOverrides = {
         cron_session_read_only: {
           title: '此聊天属于一个定时任务',
           body: '它只运行该任务，因此你的消息未被执行。请新建聊天后再发送。'
+        },
+        workspace_unavailable: {
+          title: '此聊天的文件夹已不存在',
+          body: '此聊天使用的文件夹已被移动或删除，因此你的消息未被执行。请重新创建该文件夹，或使用“移动到项目”为聊天指定其他文件夹，然后重试。'
         }
-      },
-      errorLayers: {
-        auth: '认证错误',
-        billing: '额度不足',
-        disk: '磁盘已满',
-        endpoint: '自定义端点错误',
-        gateway: '网关错误',
-        generic: '本轮失败',
-        provider: '模型服务商错误',
-        runtime: '本地运行时错误',
-        streaming: '流式连接错误'
       },
       errorRetry: '重试',
       errorLimitResets: time => `限额将于 ${time} 重置`,

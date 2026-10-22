@@ -5,10 +5,12 @@ import { ruBoot } from './ru_boot'
 import { ruCatalog, ruSkillDeepLink } from './ru_catalog'
 import { ruClarify } from './ru_clarify'
 import { ruConnectors } from './ru_connectors'
+import { ruErrorCodes } from './ru_error_codes'
 import { ruFirstRun } from './ru_first_run'
 import { ruModelMenu } from './ru_model_menu'
 import { ruModelSettings } from './ru_model_settings'
 import { ruNotices } from './ru_notices'
+import { ruNotifications } from './ru_notifications'
 import { ruOnboarding } from './ru_onboarding'
 import { ruPluginSettings } from './ru_plugins'
 import { ruProjects } from './ru_projects'
@@ -38,7 +40,6 @@ const RU_NOUN = (count: number | string, one: string, few: string, many: string)
 }
 
 export const ruOverrides = {
-
   catalog: ruCatalog,
   connectors: ruConnectors.connectors,
   sharedMetrics: ruSharedMetrics,
@@ -423,52 +424,7 @@ export const ruOverrides = {
       plugins: 'Плагины'
     },
     plugins: ruPluginSettings.plugins,
-    notifications: {
-      title: 'Уведомления',
-      intro: 'Системные уведомления (не всплывающие внутри приложения). Настраивается для каждого устройства.',
-      enableAll: 'Включить уведомления',
-      enableAllDesc: 'Если выключено — все уведомления ниже будут заглушены.',
-      focusedHint: 'Оповещения о завершении срабатывают только пока Hermes в фоне.',
-      kinds: {
-        approval: {
-          label: 'Нужно одобрение',
-          description: 'Команда ожидает вашего одобрения или отклонения.'
-        },
-        input: {
-          label: 'Нужен ввод',
-          description: 'Hermes задал вопрос или требует пароль/секрет.'
-        },
-        turnDone: {
-          label: 'Ответ готов',
-          description: 'Ход завершился, пока Hermes был в фоне.'
-        },
-        turnError: {
-          label: 'Ход не удался',
-          description: 'Ошибки фоновых ходов.'
-        },
-        backgroundDone: {
-          label: 'Фоновая задача завершена',
-          description: 'Фоновая команда терминала выполнена.'
-        },
-        credits: {
-          label: 'Оповещения о кредитах',
-          description: 'Доступ к кредитам приостановлен или восстановлен.'
-        },
-        plugin: {
-          label: 'Уведомления плагинов',
-          description: 'Плагин приложения отправил уведомление, пока Hermes был в фоне.'
-        }
-      },
-      test: 'Отправить тестовое уведомление',
-      testTitle: 'Hermes',
-      testBody: 'Уведомления работают.',
-      testSent:
-        'Тест отправлен. Если ничего не появилось, проверьте разрешения на уведомления в системе и режим «Не беспокоить».',
-      testUnsupported: 'Эта система не поддерживает системные уведомления.',
-      completionSoundTitle: 'Звук завершения',
-      completionSoundDesc: 'Воспроизводится, когда ход агента завершён. Выберите пресет и прослушайте здесь.',
-      completionSoundPreview: 'Прослушать'
-    },
+    notifications: ruNotifications,
     sections: {
       model: 'Модель',
       chat: 'Чат',
@@ -3547,12 +3503,7 @@ export const ruOverrides = {
       branchNewChat: 'Ветка в новый чат',
       react: 'Реакция',
       dismissError: 'Скрыть ошибку',
-      errorCodes: {
-        cron_session_read_only: {
-          title: 'Этот чат относится к запланированной задаче',
-          body: 'Он только выполняет эту задачу, поэтому ваше сообщение не было выполнено. Начните новый чат, чтобы отправить его.'
-        }
-      },
+      errorCodes: ruErrorCodes,
       filesChanged: count => `${count} ${RU_PLURAL(count, 'файл изменён', 'файла изменено', 'файлов изменено')}`,
       reviewChanges: 'Проверить',
       readAloudFailed: 'Не удалось зачитать вслух',
