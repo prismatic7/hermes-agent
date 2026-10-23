@@ -98,7 +98,11 @@ def _colliding_members(entries: list[Entry]) -> dict[Path, str]:
             declaration = read_python_declaration(plugin_dir)
         except (OSError, ValueError, TypeError):
             continue
-        if not declaration.installs_packages or declaration.pyproject is None:
+        # Local declarations model (6661080238) replaced PythonDeclaration.is_member with
+        # installs_packages; upstream's collision sweep needs "a real pyproject on a
+        # non-external plugin", which is the same set is_member + `pyproject is None`
+        # selected upstream.
+        if declaration.external or declaration.pyproject is None:
             continue
         try:
             document = tomllib.loads(declaration.pyproject.read_text(encoding="utf-8-sig"))
