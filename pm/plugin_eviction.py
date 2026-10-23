@@ -98,7 +98,7 @@ def _colliding_members(entries: list[Entry]) -> dict[Path, str]:
             declaration = read_python_declaration(plugin_dir)
         except (OSError, ValueError, TypeError):
             continue
-        if not declaration.is_member or declaration.pyproject is None:
+        if not declaration.installs_packages or declaration.pyproject is None:
             continue
         try:
             document = tomllib.loads(declaration.pyproject.read_text(encoding="utf-8-sig"))
