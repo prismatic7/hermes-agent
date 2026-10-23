@@ -67,6 +67,38 @@ def test_two_homes_with_one_buildable_name_collide(tmp_path):
     assert str(b.parent.parent.resolve()) not in reason_b
 
 
+def test_admission_refuses_a_selection_two_homes_cannot_build(tmp_path, monkeypatch):
+    """Admission must refuse with the reconcile instruction instead of uv's
+    resolver noise: uv refuses the WHOLE workspace, and the resolver text names
+    hashed member dirs no user can act on (issue #142712 class)."""
+    import pytest
+
+    from pm.package import InstallError
+    from pm.publication import candidate_members
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    current = home / "plugins" / "shared"
+    other_home = home / "profiles" / "other"
+    other = other_home / "plugins" / "shared"
+    for member in (current, other):
+        member.mkdir(parents=True)
+        (member / "pyproject.toml").write_text(
+            '[project]\nname = "hermes-shared"\nversion = "1.0.0"\n'
+            '[build-system]\nrequires = []\nbuild-backend = "backend"\n',
+            encoding="utf-8",
+        )
+    (home / "config.yaml").write_text("plugins:\n  enabled: [shared]\n  disabled: []\n")
+    (other_home / "config.yaml").write_text("plugins:\n  enabled: [shared]\n")
+
+    with pytest.raises(InstallError) as excinfo:
+        candidate_members(proposed_home=home, enabled=["shared"], disabled=[])
+    message = str(excinfo.value)
+    assert "hermes-shared" in message
+    assert "shares the build-metadata name" in message
+    assert "disable the duplicate in all but one profile" in message
+
+
 def test_a_single_home_copy_never_collides(tmp_path):
     """The common case must cost nothing and offer no member up."""
     a = _buildable(tmp_path / "enodios" / "plugins" / "custom-dangerous-patterns",
@@ -279,7 +311,7 @@ def test_enabled_member_dirs_drops_a_colliding_pair_for_every_caller(tmp_path, m
     import pm.plugins_state as pstate
     from pm.workspace import enabled_member_dirs
 
-    default_home, collided, innocent = _two_homes_with_one_collision(tmp_path)
+    default_home, _collided, innocent = _two_homes_with_one_collision(tmp_path)
     # dependency_homes() imports this name lazily, so patch where it is looked up.
     monkeypatch.setattr(pm.environments, "dependency_home_root", lambda: default_home)
     monkeypatch.setattr(pstate, "_profiles_root", lambda: tmp_path / "profiles")
