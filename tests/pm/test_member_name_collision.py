@@ -34,7 +34,8 @@ def _buildable(plugin: Path, name: str, *, uv_package: bool = False) -> Path:
 def _virtual(plugin: Path, name: str) -> Path:
     plugin.mkdir(parents=True, exist_ok=True)
     (plugin / "pyproject.toml").write_text(
-        "[project]\n" f'name = "{name}"\n' 'version = "1.0.0"\n' "[tool.uv]\npackage = false\n",
+        "[project]\n" f'name = "{name}"\n' 'version = "1.0.0"\n'
+        'dependencies = ["requests>=2"]\n' "[tool.uv]\npackage = false\n",
         encoding="utf-8",
     )
     return plugin
