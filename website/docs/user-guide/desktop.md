@@ -626,17 +626,19 @@ Set a username and password, then start the backend bound to a reachable address
 cat >> ~/.hermes/.env <<'EOF'
 HERMES_DASHBOARD_BASIC_AUTH_USERNAME=admin
 HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=choose-a-strong-password
+EOF
 # Recommended: a stable signing secret so sessions survive restarts.
 # Without it a random key is generated per boot and you'll be logged out
-# on every restart.
-HERMES_DASHBOARD_BASIC_AUTH_SECRET=$(openssl rand -base64 32)
-EOF
+# on every restart. This runs openssl, so the secret is unique to you.
+echo "HERMES_DASHBOARD_BASIC_AUTH_SECRET=$(openssl rand -base64 32)" >> ~/.hermes/.env
 chmod 600 ~/.hermes/.env
 
 # 2. Run the backend bound to a reachable address. The non-loopback bind
 #    engages the auth gate; the username/password provider handles login.
 hermes serve --host 0.0.0.0 --port 9119
 ```
+
+An earlier version of this recipe wrote the secret line inside the quoted heredoc, which stores the text `$(openssl rand -base64 32)` instead of a random value. If `grep BASIC_AUTH_SECRET ~/.hermes/.env` shows that text, replace the line with a freshly generated secret and restart the backend.
 
 Keep that `hermes serve` process running for as long as you want the desktop app to be able to connect — if it stops, the app can no longer reach the backend. Run it under `systemd`, `tmux`, or your process manager of choice so it survives logout and reboots.
 
@@ -705,6 +707,14 @@ SHA-pinned) plus an import allowlist — not isolation. A plugin whose
 `register()` throws is rolled back and shown as **Failed** with the error on its
 row; **⌘K → Reload desktop plugins** re-reads every installed `plugin.js`,
 including one an installer replaced in place.
+
+The [Webapp](#use-the-desktop-workspace-from-a-browser) loads the desktop plugins installed on the
+host that serves it, from the `desktop-plugins` folder of that host's Hermes root, whichever profile
+the tab is on. A new or removed plugin folder shows up within seconds; an edited `plugin.js` loads on
+**⌘K → Reload desktop plugins**, since a browser cannot watch the host's files. The desktop half of
+an agent+desktop package appears once native Desktop on that host has copied it into the folder.
+Install and remove desktop plugins from native Desktop or in the folder itself; a plugin's folder
+access (`ctx.files`) is not available in a browser.
 
 **Capabilities → Plugins** is the one place for everything that extends
 Hermes: **one row per plugin**, with two switch columns.
@@ -824,6 +834,10 @@ launcher. PM selects its interpreter and dependency generation. A missing
 bootstrap marker does not force installation when that launcher works.
 
 On Linux, Chromium's own errors go to `HERMES_HOME/logs/desktop-chromium.log`, and a crash of the shell itself leaves a minidump under the app's `Crashpad/` directory (inside Electron's user-data directory, next to `connection.json`). If the window vanishes with `SIGTRAP` in the journal, the `FATAL:` line in that log names the check that fired; attach it to the bug report. Nothing is uploaded.
+
+On Ubuntu 23.10 and later, `kernel.apparmor_restrict_unprivileged_userns=1` blocks Chromium's user-namespace sandbox for any program without an AppArmor profile. `hermes desktop` checks this through the Hermes binary itself and then uses Chromium's setuid `chrome-sandbox` helper (root-owned, mode 4755), which asks for `sudo` again after each rebuild. That helper is the recommended route. If the helper cannot be set up either, Desktop starts with `--no-sandbox` and the launcher prints both commands, the helper first.
+
+`hermes desktop --install-apparmor-profile` is the opt-in alternative that survives rebuilds: it installs a profile under `/etc/apparmor.d/` (sudo required) that grants user namespaces to this app's path. Chrome and VS Code get the same grant, but for root-owned binaries. This app's path is usually in a checkout your account can write, so any program running as you could put its own binary there and get the user namespaces the restriction withholds. For your account, that is about the same as turning the restriction off. The command refuses install paths containing AppArmor pattern characters (`? * [ ] { } ^ " \` and non-printable characters; see apparmor.d(5) "Globbing"). It checks the profile with `apparmor_parser --skip-kernel-load` before writing anything, and removes the file again if loading it fails.
 
 If Python dependencies are damaged, run the installation's `hermes pm repair`.
 Then restart Desktop. Do not delete guessed `venv` paths or PM facts. For
