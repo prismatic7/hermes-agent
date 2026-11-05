@@ -1,0 +1,19 @@
+name: hermes-ears
+repo: https://github.com/prismatic7/hermes-ears
+sha: 7010d3e788c8ee25ce95c82e5eea9fab6d83c15d
+version: "0.1.0"
+title: Hermes Ears
+description: "A listening engine: measure an audio file, then state only what the measurements carry. Returns peak level, unweighted RMS, crest factor, DC offset and clipping runs; spectral centroid, 85% rolloff, flatness and ten octave-band power shares; onset count and rate, silence windows; stereo correlation, L/R balance and a decay estimate. Every figure carries the method that produced it, every interpretation is tagged inferred and names the measurements behind it, and every record lists what the instrument cannot establish (no speech recognition, no source separation, no quality judgement, no source identity, no equal-loudness weighting, decay is not RT60). Disclosure — decodes the file the caller names by running the host's ffmpeg and ffprobe as separate executables with a fixed argument vector (never a shell); reads only that file; writes nothing; no network calls, no credentials, no telemetry. Decoding time is proportional to file length and runs in the foreground of the tool call."
+maintainer: prismatic7
+tier: community
+category: tools
+docs_url: https://github.com/prismatic7/hermes-ears#readme
+readme: true
+platforms: [macos, linux]
+requires_hermes: ">=0.21.5"
+capabilities:
+  provides_tools:
+    - ears_listen
+  provides_hooks: []
+  provides_middleware: []
+  requires_env: []
