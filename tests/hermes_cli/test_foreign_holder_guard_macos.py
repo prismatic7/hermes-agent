@@ -126,8 +126,14 @@ def test_restore_refuses_to_unlink_sidecar_held_by_live_process(tmp_path):
     The inode-preserving ``sqlite3.backup()`` primary path is safe under a live
     holder, so to reach the inlined unlink+move fallback — the path that actually
     unlinks sidecars — the destination header must be unreadable.
+
+    The destination is deliberately NOT a store filename (``state.db`` /
+    ``shared-state.db``): upstream routes those through the storage backend's
+    admin, which enforces a runtime-epoch floor the doomed header makes
+    unreadable, so the call would refuse for that reason instead of exercising
+    the holder guard.
     """
-    dst = tmp_path / "state.db"
+    dst = tmp_path / "custom.db"
     src = tmp_path / "snap.db"
     _make_db(src, "snapshot-good")
     _make_db(dst, "live-old")
