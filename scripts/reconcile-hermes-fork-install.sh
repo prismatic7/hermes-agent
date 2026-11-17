@@ -206,7 +206,12 @@ fi
 # resolves even when the finder is broken. The auditor neutralises this itself;
 # this is belt and braces for the shell side.
 cd /tmp || exit 2
-AUDIT_OUT="$(run_to 120 "$PY" "$AUDIT" "$REPO" 2>&1)"
+# Judge the venv's OWN site-packages - the artifact the pip steps below rewrite. A
+# PM generation on PYTHONPATH ships its own copy of the editable finder, and that
+# copy lags the tree until the runtime relaunches, so an inherited PYTHONPATH makes
+# every package added since the last mint read as "unresolvable" and fails a healthy
+# install (measured 2026-11-18: persistence, session_rules after the fork merge).
+AUDIT_OUT="$(unset PYTHONPATH; run_to 120 "$PY" "$AUDIT" "$REPO" 2>&1)"
 AUDIT_RC=$?
 AUDIT_LINE="$(printf '%s\n' "$AUDIT_OUT" | grep '^satisfied:' | head -1)"
 
@@ -296,7 +301,7 @@ fi
 # Both pip commands regenerate the editable finder, so the thing being fixed
 # and the thing doing the fixing touch the same artifact. Confirm the repair
 # survived its own repair.
-AFTER_OUT="$(run_to 120 "$PY" "$AUDIT" "$REPO" 2>&1)"
+AFTER_OUT="$(unset PYTHONPATH; run_to 120 "$PY" "$AUDIT" "$REPO" 2>&1)"
 AFTER_RC=$?
 AFTER_LINE="$(printf '%s\n' "$AFTER_OUT" | grep '^satisfied:' | head -1)"
 
