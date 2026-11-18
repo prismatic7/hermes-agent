@@ -188,7 +188,11 @@ reconcile_deps() {  # reconcile_deps <timeout>
       done
     fi
   fi
-  if [ -n "$UV_BIN" ] && [ -f "$REPO/uv.lock" ]; then
+  # Only python >= 3.14 needs the lock path; below that browser-harness is marker-
+  # excluded, pip resolves cleanly, and `uv sync` would PRUNE packages the host's
+  # venv legitimately carries outside the lock (horza and work run 3.11 venvs).
+  if "$PY" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 14) else 1)' >/dev/null 2>&1 \
+     && [ -n "$UV_BIN" ] && [ -f "$REPO/uv.lock" ]; then
     local had="${UV_PROJECT_ENVIRONMENT-}"
     export UV_PROJECT_ENVIRONMENT="$VENV"
     run_to "$1" "$UV_BIN" sync --frozen --quiet --directory "$REPO" || rc=$?
