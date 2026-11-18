@@ -170,6 +170,34 @@ install_editable() {
   return "$rc"
 }
 
+# Step 4 resolves dependencies from the repo's lock with uv, not with pip.
+# pip cannot honour [tool.uv].override-dependencies, and the tree now NEEDS those
+# overrides: browser-harness 0.1.13 pins pillow==12.3.0 while the project requires
+# Pillow 13 (the advisory fix), so `pip install -e .` answers ResolutionImpossible
+# on any python where browser-harness is a core dep (>= 3.14). Measured
+# 2026-11-18 on sma right after the 3.14 venv rebuild.
+reconcile_deps() {  # reconcile_deps <timeout>
+  local rc=0
+  # UV_BIN is only resolved above when pip is absent; the lock-based reconcile needs
+  # it on pip hosts too, and cron's PATH has neither ~/.local/bin nor /opt/homebrew/bin.
+  if [ -z "$UV_BIN" ]; then
+    UV_BIN="$(command -v uv || true)"
+    if [ -z "$UV_BIN" ]; then
+      for _c in "$HOME/.local/bin/uv" /opt/homebrew/bin/uv /usr/local/bin/uv; do
+        [ -x "$_c" ] && UV_BIN="$_c" && break
+      done
+    fi
+  fi
+  if [ -n "$UV_BIN" ] && [ -f "$REPO/uv.lock" ]; then
+    local had="${UV_PROJECT_ENVIRONMENT-}"
+    export UV_PROJECT_ENVIRONMENT="$VENV"
+    run_to "$1" "$UV_BIN" sync --frozen --quiet --directory "$REPO" || rc=$?
+    if [ -n "$had" ]; then export UV_PROJECT_ENVIRONMENT="$had"; else unset UV_PROJECT_ENVIRONMENT; fi
+    return "$rc"
+  fi
+  install_editable "" "$1"
+}
+
 # ── 0. sanity ───────────────────────────────────────────────────────────────
 if [ ! -x "$PY" ]; then
   say "FAILED: venv python missing at $PY"
@@ -241,7 +269,7 @@ note "$AUDIT_LINE"
 if $DRY_RUN; then
   note "[DRY RUN] would back up, then:"
   note "  pip install -e . --no-deps      (regenerate editable finder)"
-  note "  pip install -e . --no-input     (reconcile dependencies)"
+  note "  uv sync --frozen             (reconcile dependencies from the lock)"
   note "  re-audit                        (confirm the repair did not re-break)"
   say "DRY RUN: would reconcile"
   exit 0
@@ -290,8 +318,8 @@ fi
 # Full install, deliberately NOT --no-deps: step 3 skipped exactly these, and
 # they are how the 2026-09-24 gaps appeared. Every direct dep is exact-pinned
 # in pyproject, so this resolves to the reviewed set rather than drifting.
-note "reconciling dependencies (full editable install) ..."
-if ! install_editable "" 600 > "$BK/reconcile.log" 2>&1; then
+note "reconciling dependencies (from uv.lock when available) ..."
+if ! reconcile_deps 600 > "$BK/reconcile.log" 2>&1; then
   say "FAILED: dependency reconcile failed (see $BK/reconcile.log)"
   tail -6 "$BK/reconcile.log" 2>/dev/null | sed 's/^/  /'
   exit 1
