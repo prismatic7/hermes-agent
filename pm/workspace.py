@@ -216,6 +216,7 @@ def _generate_pyproject(plugin_dirs: list[Path] | Mapping[Path, Path], root: Pat
 
     candidates = {identity: source for identity, source in member_sources(plugin_dirs).items()
                   if _is_member_candidate(source)}
+    candidates = _same_distribution_copies(candidates)
     target = _target_environment(python) if candidates else {}
     members = [_workspace_member(source, root, identity=identity, extras=extras, target=target)
                .relative_to(root).as_posix() for identity, source in candidates.items()]
@@ -669,6 +670,39 @@ def hermes_fit_error(declaration, extras: Iterable[str] | None = None) -> Option
     from hermes_cli.plugins_manifest import requires_hermes_error
 
     return requires_hermes_error(declaration.manifest) or core_requirement_error(declaration, extras)
+
+
+def _same_distribution_copies(candidates: Mapping[Path, Path]) -> dict[Path, Path]:
+    """Keep one member per distribution when the same package is reachable from two plugin homes.
+
+    ``hermes profile create --clone`` copies plugins into the new profile, so one distribution
+    then sits under two homes. uv keys a workspace member by ``[project].name``, and two members
+    declaring one name fail ``uv lock`` before resolution ever runs, which strands the whole
+    environment. Copies whose declaration is identical are that one distribution, so the first
+    identity stands for all of them; differing declarations are left alone so a real two-version
+    conflict still surfaces.
+    """
+    import tomllib
+
+    kept: dict[Path, Path] = {}
+    seen: dict[tuple[str, bytes, tuple[str, ...]], Path] = {}
+    for identity, source in sorted(candidates.items(), key=lambda row: str(row[0])):
+        try:
+            declaration = read_python_declaration(source)
+            pyproject = declaration.pyproject
+            document = tomllib.loads(pyproject.read_text(encoding="utf-8-sig")) if pyproject else {}
+            name = str((document.get("project") or {}).get("name") or "")
+            signature = (name, pyproject.read_bytes(), declaration.install_requirements) if name and pyproject else None
+        except (OSError, ValueError, tomllib.TOMLDecodeError):  # unreadable: let its own diagnosis stand
+            signature = None
+        if signature is None:
+            kept[identity] = source
+            continue
+        if signature in seen:
+            continue
+        seen[signature] = identity
+        kept[identity] = source
+    return kept
 
 
 def _workspace_member(plugin_dir: Path, root: Path, *, identity: Path, extras: Iterable[str] = (),
