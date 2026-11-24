@@ -63,3 +63,28 @@ def test_single_query_mode_never_auto_approves_this_gate(tmp_path, monkeypatch, 
     assert asked == []
     assert "BLOCKED" in res["error"]
     assert not target.exists()
+
+
+def test_gateway_timeout_names_the_surface_that_could_not_show_it(tmp_path, monkeypatch):
+    """A local viewer (tui/gui) ACKs the gateway send and renders nothing, so the wait expires with no
+    prompt anyone could answer. That refusal must name the surface and the one that works — "timed out"
+    alone reads as a human ignoring a prompt nobody saw."""
+    from tools import approval
+    import tools.approval_gateway_wait as gw
+    from tools.file_tools import write_file_tool
+
+    monkeypatch.setenv("HERMES_SESSION_KEY", "tui-session")
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "tui")
+    monkeypatch.setattr(gw, "_await_gateway_decision",
+                        lambda *a, **kw: {"resolved": False, "choice": None})
+    approval.register_gateway_notify("tui-session", lambda data: None)
+    try:
+        target = tmp_path / "SOUL.md"
+        res = json.loads(write_file_tool(str(target), "content"))
+    finally:
+        approval.unregister_gateway_notify("tui-session")
+
+    assert "BLOCKED" in res["error"]
+    assert "sent to the tui surface" in res["error"]
+    assert "hermes chat --cli" in res["error"]
+    assert not target.exists()

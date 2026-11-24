@@ -64,6 +64,10 @@ def _tools_changed_notice(payload):
     return f"Editor MCP tools changed (servers: {servers}); the new tool list applies from the next turn.\n"
 
 
+# How long a prompt waits for the owner to settle an editor-cancelled turn before reporting it ended.
+_CANCEL_REPORT_GRACE_S = 1.5
+
+
 class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
     def __init__(self):
         self._conn = None
@@ -104,6 +108,9 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         # re-attaches sent and adopted (a snapshot covers the submits sent before its resume).
         self._cut, self._inflight, self._lost, self._resumes, self._adopted = {}, {}, {}, {}, {}
         self._pending_cancels = set()
+        # Admissions the editor asked to stop: their prompt reports the turn ended within the
+        # client's patience instead of waiting for the owner to finish unwinding.
+        self._cancelled: set[str] = set()
         # (session, tool_call_id) -> (tool name, args, admission) of a call still open on the editor.
         self._tool_args = {}
         # Session -> AssistantMessageIdAllocator: the ``messageId`` of the assistant message being streamed.
@@ -454,6 +461,7 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             if session_id in self._submitting:
                 self._pending_cancels.add(session_id)
             return
+        self._cancelled.add(admission_id)
         await self._cancel_admission(session_id, admission_id)
 
     async def fork_session(self, cwd, session_id, mcp_servers=None, **kwargs):
@@ -701,26 +709,44 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         if admission_id is None:
             return PromptResponse(stop_reason='end_turn')
         self._inflight[(session_id, admission_id)] = None
+        # Watch the owner's receipt for this turn's outcome. The event stream can end a turn
+        # without delivering its terminal frame (no reply text to complete), and a prompt that
+        # only watches the stream then blocks forever — the editor reports a turn that never ends.
+        watcher = asyncio.create_task(
+            self._settle_from_receipt(client, held_id, session_id, admission_id))
+        watcher.add_done_callback(lambda t: None if t.cancelled() else t.exception())
         try:
             await self._after_ack(session_id, admission_id, link, resumes)
             if session_id in self._pending_cancels:
                 self._pending_cancels.discard(session_id)
                 await self._cancel_admission(session_id, admission_id)
-            async with self._changed:
-                await self._changed.wait_for(lambda: admission_id in self._terminals or self._failure is not None
-                                            or self._link != link or admission_id in self._lost
-                                            or self._blocked_admission(session_id, admission_id))
-                # A successor's unknown state cannot replace our committed terminal result.
-                if admission_id not in self._terminals:
-                    if self._link != link:
-                        # Our transport died before this turn's outcome reached us: ambiguous,
-                        # never retried on the replacement connection.
-                        raise self._lost_failure
-                    if self._failure:
-                        raise self._failure
-                    raise self._lost.pop(admission_id, None) or GatewayClientError(
-                        self._unknown_recovery(session_id, admission_id))
-                terminal = self._terminals.pop(admission_id)
+            async def _wait_terminal():
+                async with self._changed:
+                    await self._changed.wait_for(
+                        lambda: admission_id in self._terminals or self._failure is not None
+                        or self._link != link or admission_id in self._lost
+                        or self._blocked_admission(session_id, admission_id))
+                    # A successor's unknown state cannot replace our committed terminal result.
+                    if admission_id not in self._terminals:
+                        if self._link != link:
+                            # Our transport died before this turn's outcome reached us: ambiguous,
+                            # never retried on the replacement connection.
+                            raise self._lost_failure
+                        if self._failure:
+                            raise self._failure
+                        raise self._lost.pop(admission_id, None) or GatewayClientError(
+                            self._unknown_recovery(session_id, admission_id))
+                    return self._terminals.pop(admission_id)
+
+            # The editor's Stop is already acknowledged, so its turn must be reported ended within
+            # the client's own patience rather than whenever the owner finishes unwinding.
+            if admission_id in self._cancelled:
+                try:
+                    terminal = await asyncio.wait_for(_wait_terminal(), _CANCEL_REPORT_GRACE_S)
+                except TimeoutError:
+                    return PromptResponse(stop_reason='cancelled')  # the watcher settles bookkeeping
+            else:
+                terminal = await _wait_terminal()
         finally:
             # Do not let one prompt tear down a newer mapping if the session has
             # already advanced while this coroutine unwinds.
@@ -843,6 +869,30 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             async with self._changed:
                 self._lost[admission_id] = GatewayClientError("session_replay_gap")
                 self._changed.notify_all()
+
+    async def _settle_from_receipt(self, client, held_id, session_id, admission_id, *, timeout=900.0):
+        """Settle this admission from the owner's receipt.
+
+        The event stream is the normal carrier, but a turn can end without emitting its terminal
+        frame — an interrupted request and a reply with no text both take that path — and a prompt
+        that only listens for one then holds the ACP turn open forever. The receipt names the same
+        outcome, so poll it as the fallback while the stream has the first chance."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        delay = 0.1
+        while loop.time() < deadline:
+            await asyncio.sleep(delay)
+            delay = min(delay * 1.3, 1.5)
+            if admission_id in self._terminals or admission_id in self._settling:
+                return  # the stream won
+            try:
+                receipt = await client.rpc("prompt.receipt", session_id=session_id,
+                                           admission_id=admission_id, include_result=True)
+            except (GatewayClientError, OSError, TimeoutError):
+                continue  # transient: keep watching until the deadline
+            if receipt.get("status") == "terminal":
+                await self._settled_receipt(client, held_id, session_id, receipt, receipt)
+                return
 
     async def _settled_receipt(self, client, held_id, session_id, receipt, saved=None):
         """``saved``: the receipt already fetched with its result (a replay gap's recovery read)."""

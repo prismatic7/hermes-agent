@@ -221,3 +221,20 @@ async def test_no_separate_footer_when_the_captioned_photo_is_queued_for_a_reupl
 
     assert [batch[-1][1] for batch in adapter.batches] == [FOOTER, FOOTER]
     assert FOOTER not in adapter.sent
+
+def test_footered_reply_survives_the_publish_deepcopy():
+    """A published completion is deep-copied by ``session_events.publish`` before it reaches a
+    subscriber. ``FooteredReply`` is a ``str`` subclass, and ``copy``/``pickle`` reconstruct those
+    as ``cls.__new__(cls, value)`` — which cannot supply ``footer``. Without ``__reduce_ex__`` the
+    deepcopy raises TypeError, the completion frame is never published, and the viewer is left
+    showing the last tool call as still running."""
+    import copy
+    import pickle
+
+    reply = FooteredReply("Here is the answer.", FOOTER)
+    assert isinstance(reply, str)
+
+    for clone in (copy.deepcopy(reply), copy.copy(reply), pickle.loads(pickle.dumps(reply))):
+        assert type(clone) is FooteredReply
+        assert str(clone) == str(reply)
+        assert clone.runtime_footer == FOOTER

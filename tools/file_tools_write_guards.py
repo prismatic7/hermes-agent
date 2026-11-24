@@ -285,6 +285,19 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
     timed_out = blocked.format(why="approval prompt timed out without a user response. Silence is not consent.")
     denied = blocked.format(why="was denied by the user.")
 
+    def unanswered(surface: str) -> str:
+        """The timeout refusal, naming the surface the prompt was sent to.
+
+        A local viewer (TUI, Desktop) can ACK the gateway text send and still render nothing, so the
+        wait expires with no prompt the user could have answered. Naming the surface and the working
+        one is the difference between "a human ignored you" and "this surface cannot show it"."""
+        from tools.approval_context import _get_approval_timeout, format_approval_window
+        return blocked.format(why=(
+            f"approval prompt was sent to the {surface} surface and was not answered within "
+            f"{format_approval_window(_get_approval_timeout())}. Silence is not consent. If no prompt "
+            "appeared, that surface does not display approvals: repeat this write from "
+            "`hermes chat --cli`, whose approval panel shows it."))
+
     try:
         import tools.approval as _approval
         from tools.approval_context import _fire_approval_hook, get_current_session_key
@@ -298,6 +311,7 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
     # past its parent turn (#133514). One-operation only — no scope buttons.
     session_key = get_current_session_key()
     notify_cb = _approval._gateway_notify_cb(session_key)
+    surface = "cli"  # a gateway surface: the client that was asked (tui, gui, acp, ...) or "gateway"
 
     if notify_cb is not None:
         approval_data = {
@@ -313,6 +327,8 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
         if decision.get("cancelled"):
             return blocked.format(why=f"approval was withdrawn before the user answered ({decision['cancelled']}).")
         choice, timed = decision.get("choice"), not decision.get("resolved")
+        from tools.approval_context import _get_session_platform
+        surface = _get_session_platform() or "gateway"
     else:
         # CLI surface: per-thread approval callback (prompt_toolkit panel).
         try:
@@ -344,6 +360,8 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
     # Any tapped scope is a one-operation grant; nothing is persisted.
     if not timed and choice in {"once", "session", "always"}:
         return None
+    if timed and surface != "cli":
+        return unanswered(surface)
     return timed_out if timed else denied
 
 
