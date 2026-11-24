@@ -414,6 +414,19 @@ def _resolve_cron_interpreter(interpreter: str) -> tuple[Optional[str], Optional
     return str(resolved), None
 
 
+def _is_shell_script_name(name: str) -> bool:
+    """True when *name* names a shell script, including behind a dotfile-alternate tag.
+
+    A dotfile manager that keeps platform variants (yadm and friends) materialises
+    ``guard.sh`` as a symlink to ``guard.sh##os.Linux``; the tag is decoration on the
+    name, not an extension, so ``Path.suffix`` alone reads ``.Linux`` and misroutes the
+    script to Python. Stripping everything from the first ``##`` keeps the extension
+    rule exact — ``guard.sh.bak`` stays a non-shell name.
+    """
+    head, _sep, _tag = name.lower().partition("##")
+    return head.endswith((".sh", ".bash"))
+
+
 def _script_argv(
     path: Path, raw: Optional[Path] = None, interpreter: Optional[str] = None,
 ) -> tuple[Optional[list[str]], dict[str, str], Optional[str]]:
@@ -423,12 +436,13 @@ def _script_argv(
     / ``_windows_cron_python_invocation``. Interpreter selection reads PM's install records and
     may raise; callers run this inside their ``try``.
 
-    Use the CONFIGURED name (``raw``) for the suffix, not the resolved target:
-    yadm-style alternate files (``foo.sh##os.Darwin``) symlink the configured name to a
-    target whose suffix is not ``.sh``, which would otherwise misroute bash scripts to
-    Python."""
-    suffix = (raw or path).suffix.lower()
-    if suffix in {".sh", ".bash"}:
+    Read the shell extension from BOTH names: the configured one (``raw``) and the resolved
+    target. yadm-style alternate files (``foo.sh##os.Darwin``) symlink the configured name to a
+    target whose suffix is not ``.sh``, so the configured name is authoritative — but a caller
+    that omits ``raw`` must not fall back to Python for a shell script either, so the alternate
+    tag on the resolved target counts as well."""
+    if (_is_shell_script_name(path.name)
+            or _is_shell_script_name((raw or path).name)):
         # which() finds Git Bash on Windows; None there → clear error instead of a "[WinError 2]".
         _bash = shutil.which("bash") or ("/bin/bash" if os.path.isfile("/bin/bash") else None)
         if _bash is None:
