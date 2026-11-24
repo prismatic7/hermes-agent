@@ -133,11 +133,20 @@ class FooteredReply(str):
     """A final reply whose text ends with ``\n\n<runtime_footer>``. Plain text everywhere; any
     rewrite yields a plain ``str`` again, so the footer then simply stays in the text."""
     runtime_footer: str
+    _body_text: str
 
     def __new__(cls, text: str, footer: str):
         instance = super().__new__(cls, f"{text}\n\n{footer}")
         instance.runtime_footer = footer
+        instance._body_text = text
         return instance
+
+    def __reduce_ex__(self, protocol):
+        # ``str`` subclasses are reconstructed by copy/deepcopy/pickle as
+        # ``cls.__new__(cls, value)``, which cannot supply ``footer``. Carry the body and
+        # footer explicitly so a published reply survives ``session_events.publish``'s
+        # ``deepcopy(payload)`` instead of raising TypeError and dropping message.complete.
+        return (self.__class__, (self._body_text, self.runtime_footer))
 
 
 class _FooterCaption(str):

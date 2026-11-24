@@ -7,6 +7,7 @@ from __future__ import annotations
 import pytest
 
 from gateway.runtime_footer import (
+    FooteredReply,
     _home_relative_cwd,
     _model_short,
     build_footer_line,
@@ -279,3 +280,21 @@ def test_format_footer_served_model_is_opt_in_and_skips_same_model():
     assert format_runtime_footer(
         model="gpt-5.4", context_tokens=0, context_length=None, cwd="/x",
         served_model=None, fields=["served_model"]) == ""
+
+
+# ---------------------------------------------------------------------------
+# FooteredReply survives copy/deepcopy/pickle
+# ---------------------------------------------------------------------------
+
+def test_footered_reply_deepcopies_and_pickles():
+    """The gateway deepcopies every session event, and ``str``'s own reducer rebuilds a
+    subclass with one argument -- this two-argument ``__new__`` has to survive that.
+    The pickle round-trip is in-process only (a value this test built), never untrusted input."""
+    import copy
+    import pickle
+
+    reply = FooteredReply("here it is", "model-x \u00b7 29%")
+    for clone in (copy.deepcopy(reply), pickle.loads(pickle.dumps(reply))):
+        assert type(clone) is FooteredReply
+        assert str(clone) == "here it is\n\nmodel-x \u00b7 29%"
+        assert clone.runtime_footer == "model-x \u00b7 29%"
