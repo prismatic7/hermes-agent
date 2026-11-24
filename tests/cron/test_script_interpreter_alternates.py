@@ -21,7 +21,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from cron.scheduler_script import (  # noqa: E402
+from cron.scheduler_script import (
     _is_shell_script_name,
     _run_job_script,
     _script_argv,
